@@ -1,0 +1,14 @@
+[package]
+name = "minieth"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+thiserror = "1"
+tiny-keccak = { version = "2", default-features = false, features = ["keccak"] }
+secp256k1 = { version = "*", features = ["global-context", "rand-std", "recovery"] }
+ureq = "2"
+url = "*"
+log = "*"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+quickcheck = { version = "1", optional = true }

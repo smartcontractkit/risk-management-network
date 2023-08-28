@@ -1,0 +1,7 @@
+[workspace]
+
+members = [
+    "minieth",
+    "miniabi",
+    "afn",
+]
