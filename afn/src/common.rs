@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use miniabi::abi_encode::{AbiEncode, ValueToEncode};
+use miniabi::{abi_encode::AbiEncode, types::Value};
 use minieth::{
     bytes::{Bytes, Bytes32},
     keccak::keccak256,
@@ -16,22 +16,34 @@ pub type ChainId = u64;
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, PartialOrd, Ord)]
 #[repr(u64)]
 pub enum ChainName {
-    Ethereum = 1,
-    Base = 8453,
-    Optimism = 10,
-    Avax = 43114,
     Arbitrum = 42161,
-    Polygon = 137,
+    Avax = 43114,
+    Base = 8453,
     Bsc = 56,
+    Ethereum = 1,
+    Kroma = 255,
+    Optimism = 10,
+    Polygon = 137,
+    PolygonZkEvm = 1101,
+    Scroll = 534352,
+    Wemix = 1111,
 
-    Goerli = 5,
-    BaseGoerli = 84531,
-    OptimismGoerli = 420,
-    AvaxFuji = 43113,
     ArbitrumGoerli = 421613,
-    Sepolia = 11155111,
-    PolygonMumbai = 80001,
+    ArbitrumSepolia = 421614,
+    AvaxFuji = 43113,
+    BaseGoerli = 84531,
+    BaseSepolia = 84532,
     BscTestnet = 97,
+    Goerli = 5,
+    KromaSepolia = 2358,
+    OptimismGoerli = 420,
+    OptimismSepolia = 11155420,
+    PolygonMumbai = 80001,
+    PolygonZkEvmTestnet = 1442,
+    ScrollSepolia = 534351,
+    Sepolia = 11155111,
+    WemixTestnet = 1112,
+    ZkSyncGoerli = 280,
 }
 
 impl ChainName {
@@ -83,7 +95,7 @@ fn check_event_topic<T: LogSignature>(log: &EVMLog) -> Result<()> {
     let event_name = T::log_signature();
     let topic = *log
         .topics
-        .get(0)
+        .first()
         .ok_or_else(|| anyhow!("{event_name}: log.topics[0] is needed to check event topic"))?;
     if topic != T::log_topic() {
         Err(anyhow!(
@@ -127,7 +139,7 @@ impl<T: UncheckedDecodeLog> DecodeLog for T {
 
 pub trait ContractCall {
     fn contract_call_signature() -> &'static str;
-    fn contract_call_parameters(self) -> ValueToEncode;
+    fn contract_call_parameters(self) -> Value;
 }
 
 pub trait ContractCallSelector: ContractCall {

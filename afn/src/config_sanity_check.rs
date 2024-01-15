@@ -1,4 +1,7 @@
-use miniabi::abi_decode::{AbiDecode, AbiDecodeError, AbiTypeToDecode, DecodedValue, TypeToDecode};
+use miniabi::{
+    abi_decode::{AbiDecode, AbiDecodeError, AbiTypeToDecode},
+    types::{Type, Value},
+};
 use minieth::{bytes::Address, rpc::Rpc};
 
 use crate::{
@@ -15,14 +18,14 @@ pub struct OnRampStaticConfig {
 type OnRampStaticConfigAsTuple = (Address, u64, u64, u64, u128, Address, Address);
 
 impl AbiTypeToDecode for OnRampStaticConfig {
-    fn abi_type_to_decode() -> TypeToDecode {
+    fn abi_type_to_decode() -> Type {
         OnRampStaticConfigAsTuple::abi_type_to_decode()
     }
 }
 
-impl TryFrom<DecodedValue> for OnRampStaticConfig {
+impl TryFrom<Value> for OnRampStaticConfig {
     type Error = AbiDecodeError;
-    fn try_from(v: DecodedValue) -> Result<Self, Self::Error> {
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
         let (
             _link_token,
             chain_selector,
@@ -50,14 +53,14 @@ pub struct OffRampStaticConfig {
 type OffRampStaticConfigAsTuple = (Address, u64, u64, Address, Address, Address);
 
 impl AbiTypeToDecode for OffRampStaticConfig {
-    fn abi_type_to_decode() -> TypeToDecode {
+    fn abi_type_to_decode() -> Type {
         OffRampStaticConfigAsTuple::abi_type_to_decode()
     }
 }
 
-impl TryFrom<DecodedValue> for OffRampStaticConfig {
+impl TryFrom<Value> for OffRampStaticConfig {
     type Error = AbiDecodeError;
-    fn try_from(v: DecodedValue) -> Result<Self, Self::Error> {
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
         let (commit_store, chain_selector, src_chain_selector, on_ramp, _prev_off_ramp, _arm_proxy) =
             OffRampStaticConfigAsTuple::try_from(v)?;
         Ok(Self {
@@ -79,14 +82,14 @@ pub struct CommitStoreStaticConfig {
 type CommitStoreStaticConfigAsTuple = (u64, u64, Address, Address);
 
 impl AbiTypeToDecode for CommitStoreStaticConfig {
-    fn abi_type_to_decode() -> TypeToDecode {
+    fn abi_type_to_decode() -> Type {
         CommitStoreStaticConfigAsTuple::abi_type_to_decode()
     }
 }
 
-impl TryFrom<DecodedValue> for CommitStoreStaticConfig {
+impl TryFrom<Value> for CommitStoreStaticConfig {
     type Error = AbiDecodeError;
-    fn try_from(v: DecodedValue) -> Result<Self, Self::Error> {
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
         let (chain_selector, src_chain_selector, on_ramp, _arm_proxy) =
             CommitStoreStaticConfigAsTuple::try_from(v)?;
         Ok(Self {
@@ -104,10 +107,8 @@ impl ContractCall for GetStaticConfig {
         "getStaticConfig()"
     }
 
-    fn contract_call_parameters(self) -> miniabi::abi_encode::ValueToEncode {
-        miniabi::abi_encode::ValueToEncode::Static(miniabi::abi_encode::StaticValue::StaticTuple(
-            vec![],
-        ))
+    fn contract_call_parameters(self) -> Value {
+        ().into()
     }
 }
 
@@ -137,4 +138,23 @@ pub fn onchain_commit_store_static_config(
     commit_store: Address,
 ) -> anyhow::Result<CommitStoreStaticConfig> {
     fetch_onchain_static_config(rpc, commit_store)
+}
+
+struct TypeAndVersion();
+
+impl ContractCall for TypeAndVersion {
+    fn contract_call_signature() -> &'static str {
+        "typeAndVersion()"
+    }
+
+    fn contract_call_parameters(self) -> Value {
+        ().into()
+    }
+}
+
+pub fn onchain_type_and_version(rpc: &Rpc, contract: Address) -> anyhow::Result<String> {
+    Ok(String::abi_decode(rpc.call(
+        contract,
+        TypeAndVersion {}.encode_contract_call(),
+    )?)?)
 }

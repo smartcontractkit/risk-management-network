@@ -1,4 +1,4 @@
-use crate::commit_store::Interval;
+use crate::commit_store_common::Interval;
 use minieth::bytes::Bytes32;
 
 pub trait OnRampReader {

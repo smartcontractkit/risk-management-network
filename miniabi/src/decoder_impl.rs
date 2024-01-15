@@ -1,33 +1,28 @@
-use crate::abi_decode::{AbiDecodeError, DecodedValue, TypeToDecode};
+use crate::abi_decode::AbiDecodeError;
+use crate::types::{Type, Value};
 use minieth::{
     bytes::{Address, Bytes, Bytes32},
     u256::U256,
 };
 
 struct DecodeResult {
-    pub value: DecodedValue,
+    pub value: Value,
     pub new_cursor: usize,
     pub size_in_bytes: usize,
 }
 
-impl TypeToDecode {
-    fn all_static(tuple: &[TypeToDecode]) -> bool {
-        tuple.iter().all(TypeToDecode::is_static)
-    }
-    fn is_static(&self) -> bool {
-        match self {
-            TypeToDecode::Bool
-            | TypeToDecode::U256
-            | TypeToDecode::U128
-            | TypeToDecode::U64
-            | TypeToDecode::U32
-            | TypeToDecode::U16
-            | TypeToDecode::U8
-            | TypeToDecode::Address
-            | TypeToDecode::Bytes32 => true,
-            TypeToDecode::Bytes | TypeToDecode::DynamicArray(_) => false,
-            TypeToDecode::Tuple(tuple) => Self::all_static(tuple),
+impl Type {
+    pub(crate) fn decode(&self, bytes: &[u8]) -> Result<Value, AbiDecodeError> {
+        let v = self.decode_helper(bytes, 0, true)?;
+        if v.size_in_bytes != bytes.len() {
+            return Err(AbiDecodeError::InvalidEncodingSize);
         }
+        Ok(v.value)
+    }
+
+    #[cfg(feature = "arbitrary")]
+    pub fn decode_fuzzhelper(&self, bytes: &[u8]) -> Result<Value, AbiDecodeError> {
+        self.decode(bytes)
     }
 
     fn decode_helper(
@@ -37,32 +32,25 @@ impl TypeToDecode {
         is_top_level: bool,
     ) -> Result<DecodeResult, AbiDecodeError> {
         match self {
-            TypeToDecode::Bool => decode_bool_helper(bytes, cursor),
-            TypeToDecode::U256 => decode_u256_helper(bytes, cursor),
-            TypeToDecode::U128 => decode_u128_helper(bytes, cursor),
-            TypeToDecode::U64 => decode_u64_helper(bytes, cursor),
-            TypeToDecode::U32 => decode_u32_helper(bytes, cursor),
-            TypeToDecode::U16 => decode_u16_helper(bytes, cursor),
-            TypeToDecode::U8 => decode_u8_helper(bytes, cursor),
-            TypeToDecode::Address => decode_address_helper(bytes, cursor),
-            TypeToDecode::Bytes32 => decode_bytes32_helper(bytes, cursor),
-            TypeToDecode::Bytes => decode_bytes_helper(bytes, cursor),
-            TypeToDecode::DynamicArray(type_to_decode) => {
+            Type::Bool => decode_bool_helper(bytes, cursor),
+            Type::U256 => decode_u256_helper(bytes, cursor),
+            Type::U128 => decode_u128_helper(bytes, cursor),
+            Type::U64 => decode_u64_helper(bytes, cursor),
+            Type::U32 => decode_u32_helper(bytes, cursor),
+            Type::U16 => decode_u16_helper(bytes, cursor),
+            Type::U8 => decode_u8_helper(bytes, cursor),
+            Type::Address => decode_address_helper(bytes, cursor),
+            Type::Bytes32 => decode_bytes32_helper(bytes, cursor),
+            Type::Bytes => decode_bytes_helper(bytes, cursor),
+            Type::String => decode_string_helper(bytes, cursor),
+            Type::DynamicArray(type_to_decode) => {
                 decode_dynamic_array(type_to_decode, bytes, cursor)
             }
-            TypeToDecode::Tuple(tuple) => {
+            Type::Tuple(tuple) => {
                 let is_dynamic = !(is_top_level || self.is_static());
                 decode_tuple_helper(tuple, bytes, cursor, is_dynamic)
             }
         }
-    }
-
-    pub(crate) fn decode(&self, bytes: &[u8]) -> Result<DecodedValue, AbiDecodeError> {
-        let v = self.decode_helper(bytes, 0, true)?;
-        if v.size_in_bytes != bytes.len() {
-            return Err(AbiDecodeError::InvalidEncodingSize);
-        }
-        Ok(v.value)
     }
 }
 
@@ -94,7 +82,7 @@ fn bool_from_32bytes(v: [u8; 32]) -> Result<bool, AbiDecodeError> {
 fn decode_bool_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, AbiDecodeError> {
     let v: bool = bool_from_32bytes(read_first_32_bytes(bytes, cursor)?)?;
     Ok(DecodeResult {
-        value: DecodedValue::Bool(v),
+        value: Value::Bool(v),
         new_cursor: cursor + 32,
         size_in_bytes: 32,
     })
@@ -102,7 +90,7 @@ fn decode_bool_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, AbiDe
 fn decode_u256_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, AbiDecodeError> {
     let v: U256 = U256::from_be_bytes(read_first_32_bytes(bytes, cursor)?);
     Ok(DecodeResult {
-        value: DecodedValue::U256(v),
+        value: Value::U256(v),
         new_cursor: cursor + 32,
         size_in_bytes: 32,
     })
@@ -120,7 +108,7 @@ macro_rules! impl_decode_uint_helper {
                 .try_into()
                 .or(Err(AbiDecodeError::InvalidUintEncoding))?;
             Ok(DecodeResult {
-                value: DecodedValue::$constructor(v),
+                value: Value::$constructor(v),
                 new_cursor: cursor + 32,
                 size_in_bytes: 32,
             })
@@ -146,7 +134,7 @@ fn address_from_32_bytes(v: [u8; 32]) -> Result<Address, AbiDecodeError> {
 fn decode_address_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, AbiDecodeError> {
     let v: Address = address_from_32_bytes(read_first_32_bytes(bytes, cursor)?)?;
     Ok(DecodeResult {
-        value: DecodedValue::Address(v),
+        value: Value::Address(v),
         new_cursor: cursor + 32,
         size_in_bytes: 32,
     })
@@ -156,7 +144,7 @@ fn decode_bytes32_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, Ab
     let first_32_bytes: [u8; 32] = read_first_32_bytes(bytes, cursor)?;
     let v: Bytes32 = first_32_bytes.into();
     Ok(DecodeResult {
-        value: DecodedValue::Bytes32(v),
+        value: Value::Bytes32(v),
         new_cursor: cursor + 32,
         size_in_bytes: 32,
     })
@@ -202,14 +190,33 @@ fn decode_bytes_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, AbiD
     }
     let bytes = Bytes::from(data[..length].to_vec());
     Ok(DecodeResult {
-        value: DecodedValue::Bytes(bytes),
+        value: Value::Bytes(bytes),
         new_cursor: cursor + 32,
         size_in_bytes: 64 + rounded_length,
     })
 }
 
+fn decode_string_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, AbiDecodeError> {
+    match decode_bytes_helper(bytes, cursor) {
+        Err(AbiDecodeError::InvalidBytesEncoding) => Err(AbiDecodeError::InvalidStringEncoding),
+        Err(err) => Err(err),
+        Ok(DecodeResult {
+            value: Value::Bytes(bytes),
+            new_cursor,
+            size_in_bytes,
+        }) => Ok(DecodeResult {
+            value: Value::String(
+                String::from_utf8(bytes.to_vec()).map_err(|_| AbiDecodeError::InvalidValueError)?,
+            ),
+            new_cursor,
+            size_in_bytes,
+        }),
+        Ok(_) => Err(AbiDecodeError::InvalidValueError),
+    }
+}
+
 fn decode_dynamic_array(
-    type_to_decode: &TypeToDecode,
+    type_to_decode: &Type,
     bytes: &[u8],
     cursor: usize,
 ) -> Result<DecodeResult, AbiDecodeError> {
@@ -227,7 +234,7 @@ fn decode_dynamic_array(
 
     let mut data_cursor = 0;
     let mut total_size_in_bytes = 0;
-    let mut res: Vec<DecodedValue> = vec![];
+    let mut res: Vec<Value> = vec![];
     for _i in 0..length {
         let v = type_to_decode.decode_helper(bytes, data_cursor, false)?;
         res.push(v.value);
@@ -235,18 +242,21 @@ fn decode_dynamic_array(
         total_size_in_bytes += v.size_in_bytes;
     }
     Ok(DecodeResult {
-        value: DecodedValue::Array(res),
+        value: Value::DynamicArray(res),
         new_cursor: cursor + 32,
         size_in_bytes: 64 + total_size_in_bytes,
     })
 }
 
 fn decode_tuple_helper(
-    tuple: &[TypeToDecode],
+    tuple: &[Type],
     bytes: &[u8],
     cursor: usize,
     is_dynamic: bool,
 ) -> Result<DecodeResult, AbiDecodeError> {
+    if tuple.is_empty() {
+        return Err(AbiDecodeError::ZeroSizedTypeError);
+    }
     let mut total_size_in_bytes = 0;
 
     let (bytes, mut data_cursor) = if is_dynamic {
@@ -263,7 +273,7 @@ fn decode_tuple_helper(
         (bytes, cursor)
     };
 
-    let mut res: Vec<DecodedValue> = vec![];
+    let mut res: Vec<Value> = vec![];
     for type_to_decode in tuple.iter() {
         let v = type_to_decode.decode_helper(bytes, data_cursor, false)?;
         res.push(v.value);
@@ -272,7 +282,7 @@ fn decode_tuple_helper(
     }
 
     Ok(DecodeResult {
-        value: DecodedValue::Tuple(res),
+        value: Value::Tuple(res),
         new_cursor: if is_dynamic { cursor + 32 } else { data_cursor },
         size_in_bytes: total_size_in_bytes,
     })

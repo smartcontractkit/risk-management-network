@@ -5,6 +5,7 @@ use crate::{
     },
     common::ChainName,
     config::{ChainConfig, ChainStability},
+    metrics::ChainMetrics,
     worker::{self, ShutdownHandleGroup},
 };
 use anyhow::Result;
@@ -24,6 +25,7 @@ impl ChainState {
         ctx: &Arc<worker::Context>,
         rpc: Arc<Rpc>,
         config: &ChainConfig,
+        chain_metrics: Box<dyn ChainMetrics + Send>,
     ) -> Result<(Self, ShutdownHandleGroup)> {
         let mut shutdown_handles = ShutdownHandleGroup::default();
         let chain_status_worker = {
@@ -52,6 +54,7 @@ impl ChainState {
                 config.name,
                 crate::config::CHAIN_STATUS_WORKER_POLL_INTERVAL,
                 chain_status_updater,
+                chain_metrics,
             ))
         };
         let config_discovery_worker = shutdown_handles.add(OnchainConfigDiscoveryWorker::spawn(

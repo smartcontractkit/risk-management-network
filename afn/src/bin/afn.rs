@@ -10,10 +10,24 @@ use afn::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use argh::FromArgs;
-use std::{env, fs, io, os::unix::fs::OpenOptionsExt, path::Path, str::FromStr, sync::Arc};
+use minieth::{
+    bytes::{Address, Bytes},
+    u256::U256,
+};
+use std::{
+    env::{self, VarError},
+    fs, io,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 use tracing::{error, warn};
+use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 
+const LOG_JSON_ENV_VAR: &str = "AFN_LOG_JSON";
 const PASSPHRASE_ENV_VAR: &str = "AFN_PASSPHRASE";
+const METRICS_FILE_PATH_ENV_VAR: &str = "AFN_METRICS_FILE";
 
 fn user_passphrase() -> Result<String> {
     env::var(PASSPHRASE_ENV_VAR).with_context(|| {
@@ -21,6 +35,15 @@ fn user_passphrase() -> Result<String> {
     })
 }
 
+fn metrics_file_path() -> Result<Option<PathBuf>> {
+    match env::var(METRICS_FILE_PATH_ENV_VAR).as_deref() {
+        Ok(path_str) => Ok(Some(PathBuf::from_str(path_str)?)),
+        Err(VarError::NotPresent) => Ok(None),
+        v => {
+            bail!("invalid value for {METRICS_FILE_PATH_ENV_VAR}: {:?}", v);
+        }
+    }
+}
 pub trait ExecutableCmd {
     fn execute_cmd(&self) -> Result<()>;
 }
@@ -36,12 +59,42 @@ fn ensure_keys_for_chains(config: &OffchainConfig, keys: &BlessCurseKeysByChain)
     true
 }
 
+fn setup_tracing() -> Result<()> {
+    let basic_subscriber = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::builder()
+            .with_default_directive(LevelFilter::INFO.into())
+            .from_env_lossy(),
+    );
+
+    let wrap_tracing_error = |e| anyhow::anyhow!("failed to initialize tracing: {e:?}");
+
+    match env::var(LOG_JSON_ENV_VAR).as_deref() {
+        Ok("on") => {
+            basic_subscriber
+                .json()
+                .flatten_event(true)
+                .try_init()
+                .map_err(wrap_tracing_error)?;
+        }
+        Ok("off") | Err(VarError::NotPresent) => {
+            basic_subscriber
+                .compact()
+                .try_init()
+                .map_err(wrap_tracing_error)?;
+        }
+        v => {
+            bail!("invalid value for {LOG_JSON_ENV_VAR}: {:?}", v);
+        }
+    }
+    Ok(())
+}
+
 fn run_afn(
     voting_mode: VotingMode,
     keystore_path: Option<String>,
     manual_curse: Option<CurseId>,
 ) -> Result<()> {
-    tracing_subscriber::fmt::init();
+    setup_tracing()?;
 
     let config = load_config_files()?;
 
@@ -71,6 +124,7 @@ fn run_afn(
             keys.clone(),
             voting_mode,
             manual_curse,
+            metrics_file_path()?,
         )?;
         let exit_reason = state.monitor()?;
         ctx.cancel();
@@ -226,12 +280,145 @@ impl ExecutableCmd for AddrsKeystore {
     }
 }
 
+fn address_from_hex_with_0x_prefix(s: &str) -> Result<Address, String> {
+    if let Some(s_without_0x) = s.strip_prefix("0x") {
+        match Address::from_str(s_without_0x) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        Err("missing 0x prefix".to_string())
+    }
+}
+fn bytes_from_even_length_hex_with_0x_prefix(s: &str) -> Result<Bytes, String> {
+    if let Some(s_without_0x) = s.strip_prefix("0x") {
+        if s_without_0x.len() % 2 == 0 {
+            match Bytes::from_str(s_without_0x) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            Err("invalid odd-length hex string".to_string())
+        }
+    } else {
+        Err("missing 0x prefix".to_string())
+    }
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
+#[argh(
+    subcommand,
+    name = "manually-sign-transaction",
+    description = "manually sign transaction with given parameters"
+)]
+struct SignManualTransaction {
+    #[argh(option, description = "path to the keystore file to use")]
+    keystore: String,
+
+    #[argh(option, description = "decimal encoding, chain id of the transaction")]
+    chain_id: u64,
+
+    #[argh(option, description = "decimal encoding, nonce of the transaction")]
+    nonce: u64,
+
+    #[argh(option, description = "decimal encoding, gas price in wei")]
+    gas_price_in_wei: u128,
+
+    #[argh(option, description = "decimal encoding, gas limit")]
+    gas: u128,
+
+    #[argh(
+        option,
+        from_str_fn(address_from_hex_with_0x_prefix),
+        description = "address of the sender that will be signing the transaction, this address must be included in the keystore"
+    )]
+    from: Address,
+
+    #[argh(
+        option,
+        from_str_fn(address_from_hex_with_0x_prefix),
+        description = "receiving address of the transaction"
+    )]
+    to: Address,
+
+    #[argh(
+        option,
+        description = "decimal encoding, amount of native to transfer from sender to recipient "
+    )]
+    value_in_wei: u128,
+
+    #[argh(
+        option,
+        from_str_fn(bytes_from_even_length_hex_with_0x_prefix),
+        description = "hex encoding, the field data of the transaction"
+    )]
+    data_hex: Bytes,
+
+    #[argh(
+        switch,
+        description = "required flag, please make sure you understand the risk of signing an arbirary manual transaction"
+    )]
+    i_really_know_what_i_am_doing: bool,
+}
+
+impl ExecutableCmd for SignManualTransaction {
+    fn execute_cmd(&self) -> Result<()> {
+        if !self.i_really_know_what_i_am_doing {
+            bail!("Please provide flag '--i-really-know-what-i-am-doing' and make sure you understand the risk of signing an arbirary manual transaction")
+        }
+
+        let bless_curse_keys_by_chain = {
+            let file = fs::File::open(&self.keystore)?;
+            let keystore_reader = io::BufReader::new(file);
+            BlessCurseKeysByChain::from_reader(keystore_reader, &user_passphrase()?)?
+        };
+
+        let mut key = None;
+        for keys in bless_curse_keys_by_chain.0.values() {
+            if keys.bless.address() == self.from {
+                key = Some(keys.bless);
+                break;
+            }
+            if keys.curse.address() == self.from {
+                key = Some(keys.curse);
+                break;
+            }
+        }
+
+        if let Some(key) = key {
+            let tx_request = minieth::tx::LegacyTransactionRequest {
+                chain_id: self.chain_id,
+                nonce: U256::from(self.nonce),
+                gas_price: U256::from(self.gas_price_in_wei),
+                gas: U256::from(self.gas),
+                to: self.to,
+                value: U256::from(self.value_in_wei),
+                data: self.data_hex.clone(),
+            };
+            eprintln!(
+                "singing non-eip1559 transaction with key of {}: {:?}",
+                self.from, tx_request
+            );
+            let tx_bytes = tx_request.sign(&key.local_signer()).to_rlp_bytes();
+            eprintln!("signed transaction = {}", Bytes::from(tx_bytes).to_string());
+            Ok(())
+        } else {
+            bail!(
+                "no matching found for {} in keystore {}",
+                self.from,
+                self.keystore
+            )
+        }
+    }
+}
+
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand)]
 enum KeystoreCmd {
     Gen(GenKeystore),
     Update(UpdateKeystore),
     Addrs(AddrsKeystore),
+    SignManualTransaction(SignManualTransaction),
 }
 impl ExecutableCmd for KeystoreCmd {
     fn execute_cmd(&self) -> Result<()> {
@@ -239,6 +426,7 @@ impl ExecutableCmd for KeystoreCmd {
             Self::Gen(gen) => gen.execute_cmd(),
             Self::Update(update) => update.execute_cmd(),
             Self::Addrs(addrs) => addrs.execute_cmd(),
+            Self::SignManualTransaction(sign_manual_tx) => sign_manual_tx.execute_cmd(),
         }
     }
 }

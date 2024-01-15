@@ -12,3 +12,4 @@ log = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 quickcheck = { version = "1", optional = true }
+arbitrary = { version = "1", features = ["derive"], optional = true }

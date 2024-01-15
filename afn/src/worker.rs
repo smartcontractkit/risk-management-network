@@ -3,20 +3,26 @@ use std::{
     borrow::Cow,
     sync::Mutex,
     sync::{Arc, Condvar},
-    thread::JoinHandle,
+    thread::{self, JoinHandle},
     time::Duration,
 };
 use tracing::debug;
 
 #[derive(Debug)]
 pub struct ShutdownHandle {
+    ctx: Arc<Context>,
     worker_name: String,
     join_handle: Option<JoinHandle<Result<()>>>,
 }
 
 impl ShutdownHandle {
-    pub fn new(worker_name: String, join_handle: JoinHandle<Result<()>>) -> Self {
+    pub fn new(
+        ctx: Arc<Context>,
+        worker_name: String,
+        join_handle: JoinHandle<Result<()>>,
+    ) -> Self {
         Self {
+            ctx,
             worker_name,
             join_handle: Some(join_handle),
         }
@@ -52,6 +58,7 @@ impl ShutdownHandle {
 
 impl Drop for ShutdownHandle {
     fn drop(&mut self) {
+        self.ctx.cancel();
         let _join_result = self.try_join();
     }
 }
@@ -154,7 +161,7 @@ impl Context {
                 res
             })
             .expect("failed to spawn thread");
-        ShutdownHandle::new(worker_name, handle)
+        ShutdownHandle::new(Arc::clone(self), worker_name, handle)
     }
 
     pub fn spawn_repeat<F>(
@@ -173,5 +180,12 @@ impl Context {
 impl Drop for Context {
     fn drop(&mut self) {
         self.cancel()
+    }
+}
+
+pub fn worker_name() -> String {
+    match thread::current().name() {
+        Some(name) => name.to_owned(),
+        None => "[unnamed worker]".to_owned(),
     }
 }

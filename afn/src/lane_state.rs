@@ -3,17 +3,15 @@ use crate::{
     chain_status_worker::ChainStatusWorker,
     common::LaneId,
     config::{ChainConfig, LaneConfig},
-    contract_event_state_machine::{DestOffRampState, DestOffRampWorker},
+    contract_event_state_machine::{
+        ContractEventStateMachine, DestBlessState, DestBlessWorker, DestOffRampState,
+        DestOffRampWorker, SimpleExecutionStateChangedFilter, SourceBlessState, SourceBlessWorker,
+        VersionedCcipSendRequestFilter, VersionedDestEventFilter,
+    },
     hashable,
+    lane_bless_status::LaneBlessStatusWorker,
     offramp_anomaly_detector::{OffRampAnomalyDetector, OffRampAnomalyDetectorState},
     worker::{self, ShutdownHandleGroup},
-    {
-        contract_event_state_machine::{
-            ContractEventStateMachine, DestBlessState, DestBlessWorker, SourceBlessState,
-            SourceBlessWorker,
-        },
-        lane_bless_status::LaneBlessStatusWorker,
-    },
 };
 use anyhow::Result;
 use minieth::{bytes::Address, rpc::Rpc};
@@ -51,7 +49,6 @@ impl LaneState {
             &format!("SourceBlessWorker({})", lane_id),
             crate::config::CESM_POLL_INTERVAL,
             ContractEventStateMachine::new(
-                source_chain_config.source_contracts_getlogs_max_block_range,
                 source_chain_config.max_fresh_block_age.into(),
                 lane_config.source_start_block_number,
                 vec![lane_config.on_ramp],
@@ -62,6 +59,9 @@ impl LaneState {
                         dest_chain_selector: chain_selector(dest_chain_config.name),
                     },
                     seq_nrs_and_message_hashes: VecDeque::new(),
+                },
+                VersionedCcipSendRequestFilter {
+                    lane_type: lane_config.lane_type,
                 },
             ),
             source_chain_config.name,
@@ -74,7 +74,6 @@ impl LaneState {
             &format!("DestBlessWorker({})", lane_id),
             crate::config::CESM_POLL_INTERVAL,
             ContractEventStateMachine::new(
-                dest_chain_config.dest_contracts_getlogs_max_block_range,
                 dest_chain_config.max_fresh_block_age.into(),
                 lane_config.dest_start_block_number,
                 vec![lane_config.commit_store, dest_chain_config.afn_contract],
@@ -85,6 +84,9 @@ impl LaneState {
                     my_voted_but_not_yet_blessed_roots: HashSet::new(),
                     blessed_roots: HashSet::new(),
                     committed_roots_with_intervals: Vec::new(),
+                },
+                VersionedDestEventFilter {
+                    lane_type: lane_config.lane_type,
                 },
             ),
             dest_chain_config.name,
@@ -105,11 +107,11 @@ impl LaneState {
             &format!("DestOffRampWorker({})", lane_id),
             crate::config::CESM_POLL_INTERVAL,
             ContractEventStateMachine::new(
-                dest_chain_config.source_contracts_getlogs_max_block_range,
                 dest_chain_config.max_fresh_block_age.into(),
                 lane_config.dest_start_block_number,
                 vec![lane_config.off_ramp],
                 DestOffRampState::default(),
+                SimpleExecutionStateChangedFilter,
             ),
             dest_chain_config.name,
             Arc::clone(&dest_rpc),

@@ -5,30 +5,27 @@ use rusqlite::{named_params, OptionalExtension};
 use std::{
     cell::RefCell,
     cmp::{max, min},
-    fs,
-    path::Path,
+    fs::{self, DirEntry},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
 
 use minieth::{
     bytes::{Address, Bytes32},
-    rpc::{EVMLog, Rpc, RpcError},
+    rpc::{EVMLog, Rpc},
 };
 
-use crate::{common::ChainName, config::ChainStability};
+use crate::{common::ChainName, config::ChainStability, smart_get_logs::SmartGetLogs};
 
-const CACHE_BASE_DIR: &str = "./cache";
+const CACHE_DIR: &str = "cache";
 
 const SCHEMA_VERSION: u64 = 4;
 
 pub struct CachedRpc {
     parent_worker_name: String,
-    rpc: Arc<Rpc>,
     db: RefCell<LogsDb>,
-
-    addresses: Vec<Address>,
-    first_topics: Vec<Bytes32>,
+    smart_get_logs: SmartGetLogs,
 }
 
 fn query_shape_digest(
@@ -56,26 +53,12 @@ fn query_shape_digest(
 
 struct LogsDb(rusqlite::Connection);
 
-const MAX_NUM_LOGS: u64 = 1_500;
+const MAX_NUM_LOGS_OVER_MANY_BLOCKS: u64 = 1_500;
 
-#[derive(Debug)]
-pub enum LogsReadError {
-    TooManyLogs,
-    NotAvailable,
-    RusqliteError(rusqlite::Error),
-    RpcError(RpcError),
-}
-
-impl From<rusqlite::Error> for LogsReadError {
-    fn from(value: rusqlite::Error) -> Self {
-        Self::RusqliteError(value)
-    }
-}
-
-impl From<RpcError> for LogsReadError {
-    fn from(value: RpcError) -> Self {
-        Self::RpcError(value)
-    }
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PartialLogs {
+    pub to_block: u64,
+    pub logs: Vec<EVMLog>,
 }
 
 impl LogsDb {
@@ -100,55 +83,58 @@ impl LogsDb {
         Ok(Self(conn))
     }
 
-    fn get_logs(&mut self, from_block: u64, to_block: u64) -> Result<Vec<EVMLog>, LogsReadError> {
+    fn get_partial_logs(
+        &mut self,
+        from_block: u64,
+        to_block: u64,
+    ) -> anyhow::Result<Option<PartialLogs>> {
+        anyhow::ensure!(
+            from_block <= to_block,
+            "from_block {from_block} must be <= to_block {to_block}",
+        );
+
         let tx = self.0.transaction()?;
-        let db_to_block: Option<u64> = tx
-            .query_row(
-                "select to_block from queriable_block_ranges where from_block <= :from_block and to_block >= :from_block order by to_block desc limit 1",
-                named_params! {
-                    ":from_block": from_block,
-                },
-                |row| row.get(0),
-            )
-            .optional()?;
-        match db_to_block {
-            Some(db_to_block) => {
-                if db_to_block >= to_block {
-                } else {
-                    return Err(LogsReadError::TooManyLogs);
-                }
-            }
-            None => return Err(LogsReadError::NotAvailable),
-        }
-
-        let from_block_to_block_params = named_params! {
-            ":from_block": from_block,
-            ":to_block": to_block,
-        };
-
-        let num_logs: u64 = match tx.query_row(
-            "select count(1) from logs
-            where block_number >= :from_block and block_number <= :to_block",
-            from_block_to_block_params,
+        let db_to_block = match tx.query_row(
+            "select to_block from queriable_block_ranges
+            where from_block <= :from_block and to_block >= :from_block
+            order by to_block desc limit 1",
+            named_params! { ":from_block": from_block, },
             |row| row.get(0),
         ) {
-            Ok(num_logs) => num_logs,
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
 
-        if num_logs > MAX_NUM_LOGS {
-            return Err(LogsReadError::TooManyLogs);
-        }
+        let mut to_block = std::cmp::min(db_to_block, to_block);
+        loop {
+            let from_block_to_block_params = named_params! {
+                ":from_block": from_block,
+                ":to_block": to_block,
+            };
 
-        let mut st = tx.prepare_cached(
-            "select
-                block_number, block_hash, address, log_index, topic0, topic1, topic2, topic3, data
-            from logs
-            where block_number >= :from_block and block_number <= :to_block
-            order by block_number, log_index asc",
-        )?;
-        let log_results = st.query_map(from_block_to_block_params, evm_log_from_row)?;
-        Ok(log_results.collect::<Result<Vec<EVMLog>, rusqlite::Error>>()?)
+            let num_logs: u64 = tx.query_row(
+                "select count(1) from logs
+                where block_number >= :from_block and block_number <= :to_block",
+                from_block_to_block_params,
+                |row| row.get(0),
+            )?;
+
+            if from_block < to_block && num_logs > MAX_NUM_LOGS_OVER_MANY_BLOCKS {
+                to_block = from_block + (to_block - from_block) / 2;
+                continue;
+            }
+
+            let mut st = tx.prepare_cached(
+                "select block_number, block_hash, address, log_index, topic0, topic1, topic2, topic3, data
+                from logs
+                where block_number >= :from_block and block_number <= :to_block
+                order by block_number, log_index asc",
+            )?;
+            let log_results = st.query_map(from_block_to_block_params, evm_log_from_row)?;
+            let logs = log_results.collect::<Result<Vec<EVMLog>, rusqlite::Error>>()?;
+            break Ok(Some(PartialLogs { to_block, logs }));
+        }
     }
 
     pub fn save_logs(
@@ -198,6 +184,7 @@ impl LogsDb {
         )",
             )?;
             for log in logs {
+                #[allow(clippy::get_first)]
                 st.execute(named_params! {
                     ":block_number": log.block_number,
                     ":block_hash": log.block_hash.as_slice(),
@@ -250,6 +237,79 @@ fn str_to_filename(s: &str) -> String {
         .collect()
 }
 
+fn get_or_migrate_db_file_path(
+    chain: ChainName,
+    chain_stability: ChainStability,
+    addresses: &[Address],
+    first_topics: &[Bytes32],
+    parent_worker_name: &str,
+    cache_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let query_shape_digest = query_shape_digest(chain, chain_stability, addresses, first_topics)?;
+    let expected_db_filename_suffix = format!("_{}", query_shape_digest);
+    let mut existing_db_file: Option<DirEntry> = None;
+    for file in fs::read_dir(cache_dir)? {
+        let file = file?;
+        if !file.path().is_file() {
+            continue;
+        }
+        if file
+            .file_name()
+            .to_str()
+            .ok_or(anyhow::anyhow!(
+                "database filename is not valid unicode {file:?}"
+            ))?
+            .ends_with(&expected_db_filename_suffix)
+        {
+            if let Some(ref existing_db_file) = existing_db_file {
+                if existing_db_file.path() == file.path() {
+                    continue;
+                }
+                anyhow::bail!(
+                    "found multiple matching databases for worker {}: {}, {}",
+                    parent_worker_name,
+                    existing_db_file.path().display(),
+                    file.path().display(),
+                )
+            } else {
+                tracing::info!(
+                    "{}: existing db file found: {}",
+                    parent_worker_name,
+                    file.path().display()
+                );
+                existing_db_file = Some(file);
+            }
+        }
+    }
+    let desired_db_file_path = {
+        let file_name = format!(
+            "{}_{}",
+            str_to_filename(parent_worker_name),
+            query_shape_digest,
+        );
+        cache_dir.join(file_name)
+    };
+    if let Some(existing_db_file) = existing_db_file {
+        let existing_db_file_path = existing_db_file.path();
+        if existing_db_file_path != desired_db_file_path {
+            tracing::info!(
+                "{}: renaming db file from {} to {}",
+                parent_worker_name,
+                existing_db_file_path.display(),
+                desired_db_file_path.display(),
+            );
+            fs::rename(existing_db_file_path, &desired_db_file_path)?;
+        }
+    } else {
+        tracing::info!(
+            "{}: no existing db file found, using new db file {}",
+            parent_worker_name,
+            desired_db_file_path.display(),
+        )
+    }
+    Ok(desired_db_file_path)
+}
+
 impl CachedRpc {
     pub fn new(
         chain: ChainName,
@@ -259,99 +319,121 @@ impl CachedRpc {
         chain_stability: ChainStability,
         parent_worker_name: &str,
     ) -> anyhow::Result<Self> {
-        let cache_dir = Path::new(CACHE_BASE_DIR).join(format!("v{SCHEMA_VERSION}"));
-        fs::create_dir_all(&cache_dir).context("failed to create cache directory")?;
-        let db_filename = format!(
-            "{}_{}",
-            str_to_filename(parent_worker_name),
-            query_shape_digest(chain, chain_stability, addresses, &first_topics)?,
-        );
-        let our_db_file = cache_dir.join(db_filename);
-        tracing::debug!("{parent_worker_name}: db in {our_db_file:?}");
-        let db = LogsDb::open(our_db_file).context("failed to open logs db")?;
+        let cache_dir = {
+            let dir = {
+                let base_dir = std::env::current_dir()?;
+                base_dir.join(CACHE_DIR).join(format!("v{SCHEMA_VERSION}"))
+            };
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create cache directory {}", dir.display()))?;
+            dir
+        };
+        let db_file_path = get_or_migrate_db_file_path(
+            chain,
+            chain_stability,
+            addresses,
+            &first_topics,
+            parent_worker_name,
+            &cache_dir,
+        )?;
+        tracing::debug!("{parent_worker_name}: db in {db_file_path:?}");
+        let db = LogsDb::open(db_file_path).context("failed to open logs db")?;
 
         let addresses = addresses.to_vec();
 
         Ok(Self {
             parent_worker_name: parent_worker_name.to_owned(),
-            rpc,
             db: db.into(),
-            addresses,
-            first_topics,
+            smart_get_logs: SmartGetLogs::new(rpc, addresses, first_topics),
         })
     }
 
-    pub fn get_logs(
+    fn try_save_to_cache(&self, logs: &[EVMLog], from_block: u64, to_block: u64) {
+        let start = Instant::now();
+        match self.db.borrow_mut().save_logs(logs, from_block, to_block) {
+            Ok(_) => {
+                tracing::debug!(
+                    from_block,
+                    to_block,
+                    elapsed=?start.elapsed(),
+                    "{}: wrote to cache",
+                    self.parent_worker_name,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    from_block,
+                    to_block,
+                    elapsed=?start.elapsed(),
+                    error=?e,
+                    "{}: failed to write to cache",
+                    self.parent_worker_name,
+                );
+            }
+        }
+    }
+
+    fn try_fetch_from_cache(&self, from_block: u64, to_block: u64) -> Option<PartialLogs> {
+        let start = Instant::now();
+        match self.db.borrow_mut().get_partial_logs(from_block, to_block) {
+            Ok(Some(cached_logs)) => {
+                tracing::debug!(
+                    from_block,
+                    to_block=cached_logs.to_block,
+                    max_to_block=to_block,
+                    elapsed=?start.elapsed(),
+                    num_logs=cached_logs.logs.len(),
+                    "{}: cache hit",
+                    self.parent_worker_name,
+                );
+                Some(cached_logs)
+            }
+            Ok(None) => {
+                tracing::trace!(
+                    from_block,
+                    to_block,
+                    "{}: cache miss",
+                    self.parent_worker_name
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    from_block,
+                    to_block,
+                    elapsed=?start.elapsed(),
+                    error=?e,
+                    "{}: cache error",
+                    self.parent_worker_name,
+                );
+                None
+            }
+        }
+    }
+
+    pub fn get_partial_logs(
         &self,
         from_block: u64,
         to_block: u64,
         cache: bool,
-    ) -> Result<Vec<EVMLog>, LogsReadError> {
-        let start = Instant::now();
+    ) -> anyhow::Result<PartialLogs> {
+        anyhow::ensure!(
+            from_block <= to_block,
+            "from_block {from_block} must be <= to_block {to_block}",
+        );
+
         if cache {
-            match self.db.borrow_mut().get_logs(from_block, to_block) {
-                Ok(cached_response) => {
-                    tracing::debug!(
-                        "cache hit for {} {from_block}..{to_block} :) (took: {:?}, len: {})",
-                        self.parent_worker_name,
-                        start.elapsed(),
-                        cached_response.len(),
-                    );
-                    return Ok(cached_response);
-                }
-                Err(LogsReadError::TooManyLogs) => {
-                    return Err(LogsReadError::TooManyLogs);
-                }
-                Err(LogsReadError::NotAvailable) => {}
-                Err(LogsReadError::RusqliteError(e)) => {
-                    tracing::warn!(
-                        "failed to read from cache {} {from_block}..{to_block} (took {:?}, error {e:?})",
-                        self.parent_worker_name,
-                        start.elapsed(),
-                    );
-                }
-                Err(LogsReadError::RpcError(_)) => unreachable!(),
+            if let Some(partial_logs) = self.try_fetch_from_cache(from_block, to_block) {
+                return Ok(partial_logs);
             }
         }
-        match self
-            .rpc
-            .get_logs(from_block, to_block, &self.addresses, &self.first_topics)
-        {
-            Ok(fresh_response) => {
-                if cache {
-                    let start = Instant::now();
-                    match self
-                        .db
-                        .borrow_mut()
-                        .save_logs(&fresh_response, from_block, to_block)
-                    {
-                        Ok(_) => {
-                            tracing::debug!(
-                                "wrote to cache {} {from_block}..{to_block} (took {:?})",
-                                self.parent_worker_name,
-                                start.elapsed(),
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "failed to write to cache {} {from_block}..{to_block} (took {:?}, error {e:?})",
-                                self.parent_worker_name,
-                                start.elapsed(),
-                            );
-                        }
-                    }
-                }
-                Ok(fresh_response)
-            }
-            Err(RpcError::NotFound) => Err(LogsReadError::NotAvailable),
-            Err(err) => {
-                tracing::warn!(
-                    "got rpc error when querying logs for {} {from_block}..{to_block}, assuming it means TooManyLogs (took {:?}, error {err:?})",
-                    self.parent_worker_name,
-                    start.elapsed(),
-                );
-                Err(LogsReadError::TooManyLogs)
-            }
+
+        let partial_logs = self.smart_get_logs.get_partial_logs(from_block, to_block)?;
+
+        if cache {
+            self.try_save_to_cache(&partial_logs.logs, from_block, partial_logs.to_block);
         }
+
+        Ok(partial_logs)
     }
 }

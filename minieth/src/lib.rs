@@ -6,6 +6,6 @@ mod json_rpc;
 pub mod keccak;
 mod rlp;
 pub mod rpc;
-mod tx;
+pub mod tx;
 pub mod tx_sender;
 pub mod u256;

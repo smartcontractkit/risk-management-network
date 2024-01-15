@@ -1,12 +1,13 @@
 use crate::bytes::{Bytes, BytesDecodeError};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use std::fmt;
 use std::str::FromStr;
+use std::{fmt, num::TryFromIntError};
 use thiserror::Error;
 
 use crate::rlp::{rlp_encode_numerical, RlpEncodable};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct U256 {
     hi: u128,
     lo: u128,
@@ -73,9 +74,26 @@ impl FromStr for U256 {
     }
 }
 
-impl<T: Into<u128>> From<T> for U256 {
-    fn from(value: T) -> Self {
-        Self::new(value.into())
+macro_rules! impl_u256_from {
+    ($typ: ident) => {
+        impl From<$typ> for U256 {
+            fn from(value: $typ) -> Self {
+                Self::new(value.into())
+            }
+        }
+    };
+}
+impl_u256_from!(u128);
+impl_u256_from!(u64);
+impl_u256_from!(u32);
+impl_u256_from!(u16);
+impl_u256_from!(u8);
+impl_u256_from!(bool);
+
+impl TryFrom<usize> for U256 {
+    type Error = TryFromIntError;
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Ok(Self::new(u128::try_from(value)?))
     }
 }
 

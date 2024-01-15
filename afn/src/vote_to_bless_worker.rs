@@ -6,6 +6,7 @@ use crate::{
     inflight_root_cache::InflightRootCache,
     key_types::SecretKey,
     lane_bless_status::LaneBlessStatusWorker,
+    metrics::ChainMetrics,
     permutation::DELTA_STAGE,
     worker,
 };
@@ -70,6 +71,7 @@ impl VoteToBlessWorker {
         key: SecretKey,
         curse_beacon: Arc<CurseBeacon>,
         mode: VotingMode,
+        chain_metrics: Box<dyn ChainMetrics + Send>,
     ) -> Result<(Self, ShutdownHandle)> {
         let worker_name = format!("VoteToBlessWorker({},{})", config.name, config.afn_contract);
         let handle = ctx.spawn(worker_name, {
@@ -146,6 +148,10 @@ impl VoteToBlessWorker {
                             ),
                             VotingMode::DryRun | VotingMode::Passive => None,
                         };
+
+                        if txid.is_some() {
+                            chain_metrics.inc_bless_tx_counter();
+                        }
                         info!(
                             ?txid,
                             "{worker_name}: voted to bless {} tagged roots: {:?}",

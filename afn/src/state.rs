@@ -10,11 +10,12 @@ use crate::{
     config::{LaneConfig, OffchainConfig},
     config_sanity_check::{
         onchain_commit_store_static_config, onchain_offramp_static_config,
-        onchain_onramp_static_config, CommitStoreStaticConfig, OffRampStaticConfig,
-        OnRampStaticConfig,
+        onchain_onramp_static_config, onchain_type_and_version, CommitStoreStaticConfig,
+        OffRampStaticConfig, OnRampStaticConfig,
     },
     curse_beacon::{CursableAnomaliesWithCurseIds, CursableAnomaly, CurseBeacon, CurseId},
     key_types::BlessCurseKeysByChain,
+    metrics::MetricsWorker,
     reaper::{spawn_reaper, ReapableLaneWorkers},
     worker::{self, ShutdownHandleGroup},
 };
@@ -22,6 +23,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use minieth::rpc::Rpc;
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, RwLock},
     thread,
     time::Instant,
@@ -83,7 +85,9 @@ fn validate_voter_addresses(
     keys: &BlessCurseKeysByChain,
     onchain_configs: &HashMap<ChainName, VersionedOnchainConfig>,
 ) -> Result<()> {
+    tracing::info!("validating voter addresses...");
     for (chain_name, _) in config.dest_chains() {
+        tracing::info!("validating voter addresses on chain {}...", chain_name);
         let versioned_onchain_config = onchain_configs
             .get(&chain_name)
             .ok_or_else(|| anyhow!("onchain config not found: {chain_name}"))?;
@@ -121,8 +125,10 @@ fn validate_onchain_lane_config(
         on_ramp,
         commit_store,
         off_ramp,
+        lane_type,
         ..
     } = *lane_config;
+    use crate::config::LaneType::*;
     std::thread::scope(|s| {
         let handles = vec![
         s.spawn(move || {
@@ -135,6 +141,15 @@ fn validate_onchain_lane_config(
                 bail!("unexpected onchain onramp config: expected {expected_onchain_onramp_config:?}, found {onchain_onramp_config:?}")
             }
             Ok(())
+        }),
+        s.spawn(move || {
+            let onchain_onramp_type_and_version = onchain_type_and_version(&rpcs[&src_chain], on_ramp)?;
+            match (&onchain_onramp_type_and_version as &str, lane_type) {
+                ("EVM2EVMOnRamp 1.0.0" | "EVM2EVMOnRamp 1.1.0", Evm2EvmV1_0) | ("EVM2EVMOnRamp 1.2.0", Evm2EvmV1_2) => Ok(()),
+                _ => {
+                    bail!("unexpected onchain onramp type and version {onchain_onramp_type_and_version:?} for lane type {lane_type:?}");
+                }
+            }
         }),
         s.spawn(move ||{
             let onchain_offramp_config =
@@ -150,6 +165,15 @@ fn validate_onchain_lane_config(
             }
             Ok(())
         }),
+        s.spawn(move || {
+            let onchain_offramp_type_and_version = onchain_type_and_version(&rpcs[&dest_chain], off_ramp)?;
+            match (&onchain_offramp_type_and_version as &str, lane_type) {
+                ("EVM2EVMOffRamp 1.0.0" | "EVM2EVMOffRamp 1.1.0", Evm2EvmV1_0) | ("EVM2EVMOffRamp 1.2.0", Evm2EvmV1_2) => Ok(()),
+                _ => {
+                    bail!("unexpected onchain offramp type and version {onchain_offramp_type_and_version:?} for lane type {lane_type:?}");
+                }
+            }
+        }),
         s.spawn(move ||{
             let onchain_commit_store_config =
                 onchain_commit_store_static_config(&rpcs[&dest_chain], commit_store)?;
@@ -162,6 +186,15 @@ fn validate_onchain_lane_config(
                 bail!("unexpected onchain commit store config: expected {expected_onchain_commit_store_config:?}, found {onchain_commit_store_config:?}")
             }
             Ok(())
+        }),
+        s.spawn(move || {
+            let onchain_commit_store_type_and_version = onchain_type_and_version(&rpcs[&dest_chain], commit_store)?;
+            match (&onchain_commit_store_type_and_version as &str, lane_type) {
+                ("CommitStore 1.0.0" | "CommitStore 1.1.0", Evm2EvmV1_0) | ("CommitStore 1.2.0", Evm2EvmV1_2) => Ok(()),
+                _ => {
+                    bail!("unexpected onchain commit store type and version {onchain_commit_store_type_and_version:?} for lane type {lane_type:?}");
+                }
+            }
         }),
         ];
         handles
@@ -200,6 +233,7 @@ impl State {
         keys: BlessCurseKeysByChain,
         mode: VotingMode,
         manual_curse: Option<CurseId>,
+        metrics_file_path: Option<PathBuf>,
     ) -> Result<Self> {
         if let Some(manual_curse_id) = manual_curse {
             for countdown in (1..=5).rev() {
@@ -222,12 +256,19 @@ impl State {
 
         validate_onchain_configs(&config, &rpcs).context("failed to validate onchain configs")?;
 
+        let metrics_worker = Arc::new(shutdown_handles.add(MetricsWorker::spawn(
+            Arc::clone(&ctx),
+            config.chains.keys().cloned().collect(),
+            metrics_file_path,
+        )?));
+
         let mut chain_states = HashMap::new();
         for (&chain_name, chain_config) in config.chains.iter() {
             let chain_state = shutdown_handles.add_group(ChainState::new_and_spawn_workers(
                 &ctx,
                 Arc::clone(rpcs.get(&chain_name).unwrap()),
                 chain_config,
+                Box::new(metrics_worker.make_chain_metrics_handle(chain_name)),
             )?);
             chain_states.insert(chain_name, chain_state);
         }
@@ -341,6 +382,7 @@ impl State {
                     lane_bless_status_workers,
                     Arc::clone(&curse_beacon),
                     mode,
+                    Box::new(metrics_worker.make_chain_metrics_handle(chain_name)),
                 )?);
             afn_voting_managers.insert(chain_name, afn_voting_manager);
         }
@@ -410,9 +452,12 @@ impl State {
                         .copied(),
                 )
             };
-            let max_executed_seq_nr = {
+            let (executed, max_executed_seq_nr) = {
                 let dest_offramp_state = lane_state.dest_offramp_worker.unstable_state_read();
-                dest_offramp_state.max_sequence_number
+                (
+                    dest_offramp_state.successfully_executed_seq_nrs.len(),
+                    dest_offramp_state.max_sequence_number,
+                )
             };
             let votable = {
                 let lane_bless_status = lane_state
@@ -442,6 +487,7 @@ impl State {
                 ?last_msg,
                 ?last_root_with_interval,
                 ?max_executed_seq_nr,
+                executed,
                 ?since_last_checked_offramp,
                 dest_reapable_msg_ids,
                 anomalies,
