@@ -3,8 +3,8 @@ use crate::config::ChainConfig;
 use anyhow::{anyhow, Result};
 use miniabi::abi_encode::AbiEncode;
 use miniabi::{
-    abi_decode::{AbiDecode, AbiDecodeError, AbiTypeToDecode, DecodedValue, TypeToDecode},
-    abi_encode::{DynamicValue, StaticValue, ValueToEncode},
+    abi_decode::{AbiDecode, AbiDecodeError, AbiTypeToDecode},
+    types::{Type, Value},
 };
 use minieth::{
     bytes::{Address, Bytes, Bytes32},
@@ -24,13 +24,13 @@ pub struct Voter {
 }
 type VoterAsTuple = (Address, Address, Address, u8, u8);
 impl AbiTypeToDecode for Voter {
-    fn abi_type_to_decode() -> TypeToDecode {
+    fn abi_type_to_decode() -> Type {
         VoterAsTuple::abi_type_to_decode()
     }
 }
-impl TryFrom<DecodedValue> for Voter {
+impl TryFrom<Value> for Voter {
     type Error = AbiDecodeError;
-    fn try_from(v: DecodedValue) -> Result<Self, Self::Error> {
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
         let (bless_vote_addr, curse_vote_addr, curse_unvote_addr, bless_weight, curse_weight) =
             VoterAsTuple::try_from(v)?;
         Ok(Self {
@@ -53,14 +53,14 @@ pub struct OnchainConfig {
 type OnchainConfigAsTuple = (Vec<Voter>, u16, u16);
 
 impl AbiTypeToDecode for OnchainConfig {
-    fn abi_type_to_decode() -> TypeToDecode {
+    fn abi_type_to_decode() -> Type {
         OnchainConfigAsTuple::abi_type_to_decode()
     }
 }
 
-impl TryFrom<DecodedValue> for OnchainConfig {
+impl TryFrom<Value> for OnchainConfig {
     type Error = AbiDecodeError;
-    fn try_from(value: DecodedValue) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: Value) -> std::result::Result<Self, Self::Error> {
         let (voters, bless_weight_threshold, curse_weight_threshold) =
             OnchainConfigAsTuple::try_from(value)?;
         Ok(Self {
@@ -71,7 +71,7 @@ impl TryFrom<DecodedValue> for OnchainConfig {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggedRootBlessedEvent {
     pub config_version: u32,
     pub tagged_root: TaggedRoot,
@@ -100,7 +100,7 @@ impl UncheckedDecodeLog for TaggedRootBlessedEvent {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggedRootBlessVotesResetEvent {
     pub config_version: u32,
     pub tagged_root: TaggedRoot,
@@ -148,7 +148,7 @@ fn parse_indexed_config_version_voter_and_root_as_tuple(
     })?)?;
     Ok((config_version, voter))
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VotedToBlessEvent {
     pub config_version: u32,
     pub voter: Address,
@@ -177,7 +177,7 @@ impl UncheckedDecodeLog for VotedToBlessEvent {
         })
     }
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlreadyVotedToBlessEvent {
     pub config_version: u32,
     pub voter: Address,
@@ -202,7 +202,7 @@ impl UncheckedDecodeLog for AlreadyVotedToBlessEvent {
         })
     }
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlreadyBlessedEvent {
     pub config_version: u32,
     pub voter: Address,
@@ -237,30 +237,21 @@ pub struct TaggedRoot {
 type TaggedRootAsTuple = (Address, Bytes32);
 
 impl AbiTypeToDecode for TaggedRoot {
-    fn abi_type_to_decode() -> TypeToDecode {
+    fn abi_type_to_decode() -> Type {
         TaggedRootAsTuple::abi_type_to_decode()
     }
 }
-impl TryFrom<DecodedValue> for TaggedRoot {
+impl TryFrom<Value> for TaggedRoot {
     type Error = AbiDecodeError;
-    fn try_from(value: DecodedValue) -> Result<Self, Self::Error> {
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
         let (commit_store, root) = TaggedRootAsTuple::try_from(value)?;
         Ok(Self { commit_store, root })
     }
 }
 
-impl From<TaggedRoot> for StaticValue {
-    fn from(tagged_root: TaggedRoot) -> Self {
-        StaticValue::StaticTuple(vec![
-            StaticValue::Address(tagged_root.commit_store),
-            StaticValue::Bytes32(tagged_root.root),
-        ])
-    }
-}
-
-impl From<TaggedRoot> for ValueToEncode {
-    fn from(tagged_root: TaggedRoot) -> Self {
-        ValueToEncode::Static(tagged_root.into())
+impl From<TaggedRoot> for Value {
+    fn from(v: TaggedRoot) -> Self {
+        (v.commit_store, v.root).into()
     }
 }
 
@@ -275,15 +266,7 @@ impl Default for TaggedRoot {
 
 impl TaggedRoot {
     pub fn tagged_root_hash(self) -> Bytes32 {
-        keccak256(
-            ValueToEncode::Static(StaticValue::StaticTuple(vec![
-                StaticValue::Address(self.commit_store),
-                StaticValue::Bytes32(self.root),
-            ]))
-            .abi_encode()
-            .as_ref(),
-        )
-        .into()
+        keccak256(self.abi_encode().as_ref()).into()
     }
 }
 
@@ -294,13 +277,8 @@ impl ContractCall for VoteToBlessCall {
     fn contract_call_signature() -> &'static str {
         "voteToBless((address,bytes32)[])"
     }
-    fn contract_call_parameters(self) -> ValueToEncode {
-        ValueToEncode::Dynamic(DynamicValue::DynamicArrayOfStaticValue(
-            self.tagged_roots
-                .into_iter()
-                .map(|tagged_root| tagged_root.into())
-                .collect(),
-        ))
+    fn contract_call_parameters(self) -> Value {
+        (self.tagged_roots,).into()
     }
 }
 
@@ -311,10 +289,8 @@ impl ContractCall for VoteToCurseCall {
     fn contract_call_signature() -> &'static str {
         "voteToCurse(bytes32)"
     }
-    fn contract_call_parameters(self) -> ValueToEncode {
-        ValueToEncode::Static(StaticValue::StaticTuple(vec![StaticValue::Bytes32(
-            self.curse_id,
-        )]))
+    fn contract_call_parameters(self) -> Value {
+        (self.curse_id,).into()
     }
 }
 
@@ -323,8 +299,8 @@ impl ContractCall for GetConfigDetailsCall {
     fn contract_call_signature() -> &'static str {
         "getConfigDetails()"
     }
-    fn contract_call_parameters(self) -> ValueToEncode {
-        ValueToEncode::Static(StaticValue::StaticTuple(vec![]))
+    fn contract_call_parameters(self) -> Value {
+        ().into()
     }
 }
 
@@ -333,8 +309,8 @@ impl ContractCall for IsCursedCall {
     fn contract_call_signature() -> &'static str {
         "isCursed()"
     }
-    fn contract_call_parameters(self) -> ValueToEncode {
-        ValueToEncode::Static(StaticValue::StaticTuple(vec![]))
+    fn contract_call_parameters(self) -> Value {
+        ().into()
     }
 }
 

@@ -5,3 +5,4 @@ edition = "2021"
 [dependencies]
 minieth = { path = "../minieth" }
 thiserror = "1"
+arbitrary = { version = "1", features = ["derive"], optional = true }

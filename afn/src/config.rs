@@ -34,6 +34,8 @@ pub const MIN_STATUS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 pub const CONFIG_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+pub const METRICS_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Deployment {
     Prod,
@@ -73,8 +75,6 @@ pub struct ChainConfig {
     pub afn_contract: Address,
     pub inflight_time: TimeUnit,
     pub max_fresh_block_age: TimeUnit,
-    pub source_contracts_getlogs_max_block_range: u64,
-    pub dest_contracts_getlogs_max_block_range: u64,
     pub rpcs: Vec<String>,
 }
 
@@ -100,19 +100,23 @@ impl ChainConfig {
             afn_contract: shared_chain_config.afn_contract,
             inflight_time: shared_chain_config.inflight_time,
             max_fresh_block_age: shared_chain_config.max_fresh_block_age,
-            source_contracts_getlogs_max_block_range: shared_chain_config
-                .source_contracts_getlogs_max_block_range,
-            dest_contracts_getlogs_max_block_range: shared_chain_config
-                .dest_contracts_getlogs_max_block_range,
             rpcs: local_chain_config.rpcs.clone(),
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LaneType {
+    Evm2EvmV1_0,
+    Evm2EvmV1_2,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaneConfig {
     #[serde(flatten)]
     pub lane_id: LaneId,
+    #[serde(alias = "type")]
+    pub lane_type: LaneType,
     pub source_start_block_number: u64,
     pub dest_start_block_number: u64,
     pub commit_store: Address,
@@ -166,8 +170,6 @@ struct SharedChainConfig {
     pub afn_contract: Address,
     pub inflight_time: TimeUnit,
     pub max_fresh_block_age: TimeUnit,
-    pub source_contracts_getlogs_max_block_range: u64,
-    pub dest_contracts_getlogs_max_block_range: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]

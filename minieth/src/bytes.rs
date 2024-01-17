@@ -16,6 +16,7 @@ pub enum BytesDecodeError {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SizedBytes<const N: usize>([u8; N]);
 
 impl<const N: usize> From<[u8; N]> for SizedBytes<N> {
@@ -136,6 +137,7 @@ pub type Bytes20 = SizedBytes<20>;
 pub type Bytes32 = SizedBytes<32>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Bytes(Vec<u8>);
 
 impl From<Bytes> for Vec<u8> {

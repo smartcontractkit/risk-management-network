@@ -1,41 +1,10 @@
+use crate::types::{Type, Value};
 use minieth::{
     bytes::{Address, Bytes, Bytes32},
     u256::U256,
 };
 use std::convert::TryFrom;
 use thiserror::Error;
-
-#[derive(Debug, Clone)]
-pub enum TypeToDecode {
-    Bool,
-    U256,
-    U128,
-    U64,
-    U32,
-    U16,
-    U8,
-    Address,
-    Bytes32,
-    Bytes,
-    DynamicArray(Box<TypeToDecode>),
-    Tuple(Vec<TypeToDecode>),
-}
-
-#[derive(PartialEq, Eq, Debug, Clone)]
-pub enum DecodedValue {
-    Bool(bool),
-    U256(U256),
-    U128(u128),
-    U64(u64),
-    U32(u32),
-    U16(u16),
-    U8(u8),
-    Address(Address),
-    Bytes(Bytes),
-    Bytes32(Bytes32),
-    Tuple(Vec<DecodedValue>),
-    Array(Vec<DecodedValue>),
-}
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum AbiDecodeError {
@@ -53,12 +22,16 @@ pub enum AbiDecodeError {
     InvalidAddressEncoding,
     #[error("invalid bytes encoding")]
     InvalidBytesEncoding,
+    #[error("invalid string encoding")]
+    InvalidStringEncoding,
     #[error("invalid decoded value error")]
-    InvalidDecodedValueError,
+    InvalidValueError,
+    #[error("zero-sized type not supported")]
+    ZeroSizedTypeError,
 }
 
 pub trait AbiTypeToDecode {
-    fn abi_type_to_decode() -> TypeToDecode;
+    fn abi_type_to_decode() -> Type;
 }
 
 pub trait AbiDecode: AbiTypeToDecode + Sized {
@@ -67,7 +40,7 @@ pub trait AbiDecode: AbiTypeToDecode + Sized {
 
 impl<T> AbiDecode for T
 where
-    T: AbiTypeToDecode + TryFrom<DecodedValue, Error = AbiDecodeError>,
+    T: AbiTypeToDecode + TryFrom<Value, Error = AbiDecodeError>,
 {
     fn abi_decode(bytes: impl AsRef<[u8]>) -> Result<Self, AbiDecodeError> {
         let v = T::abi_type_to_decode().decode(bytes.as_ref())?;
@@ -78,8 +51,8 @@ where
 macro_rules! impl_into_type_to_decode_prim_type {
     ($type: ident, $constructor: ident) => {
         impl AbiTypeToDecode for $type {
-            fn abi_type_to_decode() -> TypeToDecode {
-                TypeToDecode::$constructor
+            fn abi_type_to_decode() -> Type {
+                Type::$constructor
             }
         }
     };
@@ -93,23 +66,20 @@ impl_into_type_to_decode_prim_type!(u16, U16);
 impl_into_type_to_decode_prim_type!(u8, U8);
 impl_into_type_to_decode_prim_type!(Address, Address);
 impl_into_type_to_decode_prim_type!(Bytes32, Bytes32);
+impl_into_type_to_decode_prim_type!(Bytes, Bytes);
+impl_into_type_to_decode_prim_type!(String, String);
 
 impl<T: AbiTypeToDecode> AbiTypeToDecode for Vec<T> {
-    fn abi_type_to_decode() -> TypeToDecode {
-        TypeToDecode::DynamicArray(Box::new(T::abi_type_to_decode()))
-    }
-}
-impl AbiTypeToDecode for Bytes {
-    fn abi_type_to_decode() -> TypeToDecode {
-        TypeToDecode::Bytes
+    fn abi_type_to_decode() -> Type {
+        Type::DynamicArray(Box::new(T::abi_type_to_decode()))
     }
 }
 
 macro_rules! impl_into_type_to_decode_tuple {
     ($($type: ident, )+) => {
         impl<$($type:AbiTypeToDecode, )+> AbiTypeToDecode for ($($type, )+) {
-            fn abi_type_to_decode() -> TypeToDecode {
-                TypeToDecode::Tuple(vec![
+            fn abi_type_to_decode() -> Type {
+                Type::Tuple(vec![
                     $($type::abi_type_to_decode(), )+
                 ])
             }
@@ -125,16 +95,17 @@ impl_into_type_to_decode_tuple!(A, B, C, D, E, F,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G, H, I,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G, H, I, J, K, L,);
+impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M,);
 
 macro_rules! impl_try_from_decoded_value_prim_type {
     ($type: ident, $constructor: ident) => {
-        impl TryFrom<DecodedValue> for $type {
+        impl TryFrom<Value> for $type {
             type Error = AbiDecodeError;
-            fn try_from(v: DecodedValue) -> Result<Self, Self::Error> {
-                if let DecodedValue::$constructor(v) = v {
+            fn try_from(v: Value) -> Result<Self, Self::Error> {
+                if let Value::$constructor(v) = v {
                     Ok(v.clone())
                 } else {
-                    Err(AbiDecodeError::InvalidDecodedValueError)
+                    Err(AbiDecodeError::InvalidValueError)
                 }
             }
         }
@@ -151,36 +122,37 @@ impl_try_from_decoded_value_prim_type!(u8, U8);
 impl_try_from_decoded_value_prim_type!(Address, Address);
 impl_try_from_decoded_value_prim_type!(Bytes32, Bytes32);
 impl_try_from_decoded_value_prim_type!(Bytes, Bytes);
+impl_try_from_decoded_value_prim_type!(String, String);
 
-impl<T> TryFrom<DecodedValue> for Vec<T>
+impl<T> TryFrom<Value> for Vec<T>
 where
-    T: TryFrom<DecodedValue, Error = AbiDecodeError>,
+    T: TryFrom<Value, Error = AbiDecodeError>,
 {
     type Error = AbiDecodeError;
-    fn try_from(v: DecodedValue) -> Result<Self, Self::Error> {
-        if let DecodedValue::Array(v) = v {
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
+        if let Value::DynamicArray(v) = v {
             v.into_iter().map(|v| T::try_from(v)).collect()
         } else {
-            Err(AbiDecodeError::InvalidDecodedValueError)
+            Err(AbiDecodeError::InvalidValueError)
         }
     }
 }
 
 macro_rules! impl_try_from_decoded_value_tuple {
     ($num: expr, $( ($type: ident , $idx: expr), )+) => {
-        impl<$($type:TryFrom<DecodedValue, Error = AbiDecodeError>, )+> TryFrom<DecodedValue> for ($($type, )+) {
+        impl<$($type:TryFrom<Value, Error = AbiDecodeError>, )+> TryFrom<Value> for ($($type, )+) {
             type Error = AbiDecodeError;
-            fn try_from(v: DecodedValue) -> Result<Self, Self::Error> {
-                if let DecodedValue::Tuple(vec) = v {
+            fn try_from(v: Value) -> Result<Self, Self::Error> {
+                if let Value::Tuple(vec) = v {
                     if vec.len() == $num {
                         Ok((
                             $($type::try_from(vec[$idx].clone())?, )+
                         ))
                     } else {
-                        Err(AbiDecodeError::InvalidDecodedValueError)
+                        Err(AbiDecodeError::InvalidValueError)
                     }
                 } else {
-                    Err(AbiDecodeError::InvalidDecodedValueError)
+                    Err(AbiDecodeError::InvalidValueError)
                 }
             }
         }
@@ -219,4 +191,20 @@ impl_try_from_decoded_value_tuple!(
     (J, 9),
     (K, 10),
     (L, 11),
+);
+impl_try_from_decoded_value_tuple!(
+    13,
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8),
+    (J, 9),
+    (K, 10),
+    (L, 11),
+    (M, 12),
 );

@@ -83,7 +83,7 @@ impl Eip1559Transaction {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LegacyTransactionRequest {
     pub chain_id: u64,
     pub nonce: U256,

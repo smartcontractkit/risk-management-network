@@ -108,7 +108,7 @@ impl FromStr for LocalSigner {
 
 impl EthereumSigner for LocalSigner {
     fn sign_hashed(&self, hashed: [u8; 32]) -> EthereumSignature {
-        let message = Message::from_slice(&hashed).unwrap();
+        let message = Message::from_digest(hashed);
         let sig = SECP256K1.sign_ecdsa_recoverable(&message, &self.secret_key);
         sig.into()
     }

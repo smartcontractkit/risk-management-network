@@ -3,6 +3,7 @@ use crate::{
     config::ChainConfig,
     curse_beacon::CurseBeacon,
     key_types::BlessCurseKeys,
+    metrics::ChainMetrics,
     worker::ShutdownHandleGroup,
     {
         lane_bless_status::LaneBlessStatusWorker, vote_to_bless_worker::VoteToBlessWorker,
@@ -48,6 +49,7 @@ impl AFNVotingManager {
         lane_bless_status_workers: HashMap<LaneId, Arc<LaneBlessStatusWorker>>,
         curse_beacon: Arc<CurseBeacon>,
         mode: VotingMode,
+        chain_metrics: Box<dyn ChainMetrics + Send>,
     ) -> Result<(Self, ShutdownHandleGroup)> {
         let mut shutdown_handles = ShutdownHandleGroup::default();
         let vote_to_bless_worker = shutdown_handles.add(VoteToBlessWorker::spawn(
@@ -60,6 +62,7 @@ impl AFNVotingManager {
             keys.bless,
             Arc::clone(&curse_beacon),
             mode,
+            chain_metrics,
         )?);
         let vote_to_curse_worker = shutdown_handles.add(VoteToCurseWorker::spawn(
             ctx,

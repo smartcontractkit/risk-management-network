@@ -1,6 +1,6 @@
 use crate::{
     afn_contract::TaggedRoot,
-    commit_report::verify_root_with_interval,
+    commit_store_common::verify_root_with_interval,
     common::LaneId,
     contract_event_state_machine::{DestBlessWorker, SourceBlessWorker},
     worker,
@@ -32,7 +32,6 @@ impl LaneBlessStatusWorker {
         let lane_bless_status = Arc::new(Mutex::new(None));
         let handle = ctx.spawn_repeat(worker_name.clone(), poll_interval, {
             let lane_bless_status = Arc::clone(&lane_bless_status);
-            let worker_name = worker_name;
             move |_ctx| -> Result<()> {
                 let latest_lane_bless_status = Self::latest_lane_bless_status(
                     &worker_name,

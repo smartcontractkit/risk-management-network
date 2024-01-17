@@ -1,10 +1,11 @@
 use crate::{
-    cached_rpc::{CachedRpc, LogsReadError},
+    cached_rpc::CachedRpc,
     chain_status::{age, ChainStatus},
     chain_status_worker::ChainStatusWorker,
     common::{ChainName, DecodeLog, LogTopic},
-    config::ChainStability,
-    evm2evm_onramp::CcipsendRequestedEvent,
+    config::{ChainStability, LaneType},
+    evm2evm_onramp_v1_0::CcipSendRequestedEventV1_0,
+    evm2evm_onramp_v1_2::CcipSendRequestedEventV1_2,
     onramp_traits::OnRampReader,
     worker::{self, ShutdownHandle},
 };
@@ -20,19 +21,22 @@ use std::{
 };
 use tracing::{trace, warn};
 
-pub trait ContractEventUnion: Sized {
-    fn log_topics() -> Vec<Bytes32>;
-    fn decode_log(log: EVMLog) -> Result<Self>;
+pub trait ContractEventFilter: Send + Sync + Clone {
+    type ContractEventUnion: Sized;
+    fn log_topics(&self) -> Vec<Bytes32>;
+    fn decode_log(&self, log: EVMLog) -> Result<Self::ContractEventUnion>;
 }
 
 pub trait State: Clone {
-    type Ev: ContractEventUnion;
+    type ContractEventUnion: Sized;
+    type ContractEventFilter: ContractEventFilter<ContractEventUnion = Self::ContractEventUnion>;
     fn update_with_event(
         &mut self,
         block_number: u64,
         block_hash: Bytes32,
         address: Address,
-        ev: Self::Ev,
+        filter: &Self::ContractEventFilter,
+        ev: Self::ContractEventUnion,
     ) -> Result<()>;
 }
 
@@ -48,12 +52,12 @@ pub enum ContractStateMachineUpdateResult {
 }
 
 pub struct ContractEventStateMachine<S: State> {
-    max_blockrange: u64,
     max_fresh_block_age: Duration,
     addresses: Vec<Address>,
     update_progress: Arc<Mutex<UpdateProgress>>,
     timestamp: Arc<Mutex<Option<u64>>>,
     state: Arc<RwLock<S>>,
+    contract_event_filter: S::ContractEventFilter,
 }
 
 impl<S: State> Clone for ContractEventStateMachine<S> {
@@ -61,26 +65,25 @@ impl<S: State> Clone for ContractEventStateMachine<S> {
         let update_progress = self.update_progress.lock().unwrap();
 
         Self {
-            max_blockrange: self.max_blockrange,
             max_fresh_block_age: self.max_fresh_block_age,
             addresses: self.addresses.clone(),
             update_progress: Arc::new(Mutex::new(update_progress.clone())),
             timestamp: Arc::new(Mutex::new(*self.timestamp.lock().unwrap())),
             state: Arc::new(RwLock::new(self.state.write().unwrap().clone())),
+            contract_event_filter: self.contract_event_filter.clone(),
         }
     }
 }
 
 impl<S: State> ContractEventStateMachine<S> {
     pub fn new(
-        max_blockrange: u64,
         max_fresh_block_age: Duration,
         start_block_number: u64,
         addresses: Vec<Address>,
         initial_state: S,
+        contract_event_filter: S::ContractEventFilter,
     ) -> Self {
         Self {
-            max_blockrange,
             max_fresh_block_age,
             addresses,
             update_progress: Arc::new(Mutex::new(UpdateProgress::NextStartBlockNumber(
@@ -88,12 +91,13 @@ impl<S: State> ContractEventStateMachine<S> {
             ))),
             timestamp: Arc::new(Mutex::new(None)),
             state: Arc::new(RwLock::new(initial_state)),
+            contract_event_filter,
         }
     }
 
     fn fork_from(&self, other: &Self) -> Result<()> {
-        if other.max_blockrange != self.max_blockrange || other.addresses != self.addresses {
-            bail!("max_blockrange or addresses mismatch");
+        if other.addresses != self.addresses {
+            bail!("addresses mismatch");
         }
 
         let mut update_progress = self.update_progress.lock().unwrap();
@@ -113,7 +117,7 @@ impl<S: State> ContractEventStateMachine<S> {
 
     pub fn update(
         &self,
-        rpc: &CachedRpc,
+        cached_rpc: &CachedRpc,
         chain_status: &ChainStatus,
         finality: Finality,
     ) -> Result<ContractStateMachineUpdateResult> {
@@ -131,50 +135,27 @@ impl<S: State> ContractEventStateMachine<S> {
             }
         };
         let tip = tail.tip();
-        let end_block_number = match finality {
+        let max_end_block_number = match finality {
             Finality::Stable => tail.stable_tip().number,
             Finality::Unstable => tip.number,
         };
 
-        if end_block_number < start_block_number {
+        if max_end_block_number < start_block_number {
             *self.timestamp.lock().unwrap() = Some(tip.timestamp);
             return Ok(ContractStateMachineUpdateResult::Complete);
         }
 
-        let (actual_end_block_number, logs) = {
-            let mut candidate_end_block_number = std::cmp::min(
-                end_block_number,
-                start_block_number
-                    .checked_add(self.max_blockrange)
-                    .and_then(|x| x.checked_sub(1))
-                    .ok_or(anyhow!("block number overflow"))?,
-            );
+        let partial_logs = cached_rpc.get_partial_logs(
+            start_block_number,
+            max_end_block_number,
+            match finality {
+                Finality::Stable => true,
+                Finality::Unstable => false,
+            },
+        )?;
 
-            loop {
-                match rpc.get_logs(
-                    start_block_number,
-                    candidate_end_block_number,
-                    match finality {
-                        Finality::Stable => true,
-                        Finality::Unstable => false,
-                    },
-                ) {
-                    Ok(logs) => break (candidate_end_block_number, logs),
-                    Err(LogsReadError::NotAvailable) => bail!("logs not available"),
-                    Err(LogsReadError::TooManyLogs)
-                        if candidate_end_block_number == start_block_number =>
-                    {
-                        bail!("even a single block ({start_block_number}) contained too many logs to handle")
-                    }
-                    Err(LogsReadError::TooManyLogs) => {
-                        tracing::debug!("block range {start_block_number}..{candidate_end_block_number} contained too many logs to handle, reducing range size");
-                        candidate_end_block_number = start_block_number
-                            + (candidate_end_block_number - start_block_number) / 2
-                    }
-                    Err(e) => bail!("got unrecoverable error while reading logs {e:?}"),
-                }
-            }
-        };
+        let end_block_number = partial_logs.to_block;
+        let logs = partial_logs.logs;
 
         {
             let mut state = self.state.write().unwrap();
@@ -196,22 +177,28 @@ impl<S: State> ContractEventStateMachine<S> {
                         ));
                     }
                 }
-                let ev = S::Ev::decode_log(log)?;
-                if let Err(e) = state.update_with_event(block_number, block_hash, address, ev) {
+                let ev = self.contract_event_filter.decode_log(log)?;
+                if let Err(e) = state.update_with_event(
+                    block_number,
+                    block_hash,
+                    address,
+                    &self.contract_event_filter,
+                    ev,
+                ) {
                     *update_progress = UpdateProgress::Corrupted;
                     return Err(e);
                 }
             }
 
-            *update_progress = UpdateProgress::NextStartBlockNumber(actual_end_block_number + 1);
+            *update_progress = UpdateProgress::NextStartBlockNumber(end_block_number + 1);
         }
 
-        Ok(if end_block_number == actual_end_block_number {
+        Ok(if end_block_number == max_end_block_number {
             *self.timestamp.lock().unwrap() = Some(tip.timestamp);
             ContractStateMachineUpdateResult::Complete
         } else {
             ContractStateMachineUpdateResult::Partial {
-                block_number: actual_end_block_number,
+                block_number: end_block_number,
             }
         })
     }
@@ -282,6 +269,7 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
         chain_status_worker: std::sync::Arc<ChainStatusWorker>,
         chain_stability: ChainStability,
     ) -> (Self, ShutdownHandle) {
+        let log_topics = cesm.contract_event_filter.log_topics();
         let stable_cesm = Arc::new(cesm);
         let unstable_cesm = Arc::new(stable_cesm.as_ref().clone());
         let handle = ctx.spawn(worker_name.to_string(), {
@@ -291,7 +279,7 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
                 let cached_rpc = CachedRpc::new(
                     chain,
                     &stable_cesm.addresses,
-                    S::Ev::log_topics(),
+                    log_topics,
                     rpc,
                     chain_stability,
                     worker_name,
@@ -333,7 +321,7 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
                             }
                             Err(e) => {
                                 unstable_update_consecutive_fails += 1;
-                                warn!("{worker_name} unstable update failed ({unstable_update_consecutive_fails} consecutive time(s)): {e}");
+                                warn!("{worker_name} unstable update failed ({unstable_update_consecutive_fails} consecutive time(s)): {e:#}");
                                 if unstable_update_consecutive_fails
                                     > MAX_UNSTABLE_UPDATE_CONSECUTIVE_FAILS
                                 {
@@ -391,13 +379,53 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
     }
 }
 
-impl ContractEventUnion for CcipsendRequestedEvent {
-    fn log_topics() -> Vec<Bytes32> {
-        vec![<Self as LogTopic>::log_topic()]
-    }
+#[derive(Debug, Clone)]
+pub enum CcipSendRequestedEventUnion {
+    Evm2EvmV1_0(CcipSendRequestedEventV1_0),
+    Evm2EvmV1_2(CcipSendRequestedEventV1_2),
+}
 
-    fn decode_log(log: EVMLog) -> Result<Self> {
-        <Self as DecodeLog>::decode_log(log)
+#[derive(Clone)]
+pub struct VersionedCcipSendRequestFilter {
+    pub lane_type: crate::config::LaneType,
+}
+
+impl ContractEventFilter for VersionedCcipSendRequestFilter {
+    type ContractEventUnion = CcipSendRequestedEventUnion;
+    fn log_topics(&self) -> Vec<Bytes32> {
+        match self.lane_type {
+            LaneType::Evm2EvmV1_0 => {
+                vec![CcipSendRequestedEventV1_0::log_topic()]
+            }
+            LaneType::Evm2EvmV1_2 => {
+                vec![CcipSendRequestedEventV1_2::log_topic()]
+            }
+        }
+    }
+    fn decode_log(&self, log: EVMLog) -> Result<Self::ContractEventUnion> {
+        let &topic = log
+            .topics
+            .first()
+            .ok_or(anyhow!("cannot decode log with empty topic"))?;
+        if matches!(self.lane_type, LaneType::Evm2EvmV1_0)
+            && topic == CcipSendRequestedEventV1_0::log_topic()
+        {
+            Ok(CcipSendRequestedEventUnion::Evm2EvmV1_0(
+                CcipSendRequestedEventV1_0::decode_log(log)?,
+            ))
+        } else if matches!(self.lane_type, LaneType::Evm2EvmV1_2)
+            && topic == CcipSendRequestedEventV1_2::log_topic()
+        {
+            Ok(CcipSendRequestedEventUnion::Evm2EvmV1_2(
+                CcipSendRequestedEventV1_2::decode_log(log)?,
+            ))
+        } else {
+            Err(anyhow!(
+                "unknown topic {:?} for lane type {:?}",
+                topic,
+                self.lane_type
+            ))
+        }
     }
 }
 
@@ -408,24 +436,41 @@ pub struct SourceBlessState {
 }
 
 impl State for SourceBlessState {
-    type Ev = CcipsendRequestedEvent;
+    type ContractEventUnion = CcipSendRequestedEventUnion;
+    type ContractEventFilter = VersionedCcipSendRequestFilter;
     fn update_with_event(
         &mut self,
         _block_number: u64,
         _block_hash: Bytes32,
         _address: Address,
-        ev: CcipsendRequestedEvent,
+        filter: &Self::ContractEventFilter,
+        ev: CcipSendRequestedEventUnion,
     ) -> Result<()> {
         use crate::hashable::Hashable;
-
-        let msg = ev.message;
-        let seq_nr = msg.sequence_number;
-        let msg_hash = msg.hash(&self.message_metadata);
-        if msg_hash != msg.message_id {
-            bail!(
-                "hash mismatch for seq_nr {seq_nr}! we computed: {msg_hash}, event contains: {}",
-                msg.message_id
-            );
+        let (seq_nr, msg_hash, msg_id) = match (filter.lane_type, ev) {
+            (LaneType::Evm2EvmV1_0, CcipSendRequestedEventUnion::Evm2EvmV1_0(ev)) => {
+                let msg = ev.message;
+                (
+                    msg.sequence_number,
+                    msg.hash(&self.message_metadata),
+                    msg.message_id,
+                )
+            }
+            (LaneType::Evm2EvmV1_2, CcipSendRequestedEventUnion::Evm2EvmV1_2(ev)) => {
+                let msg = ev.message;
+                (
+                    msg.sequence_number,
+                    msg.hash(&self.message_metadata),
+                    msg.message_id,
+                )
+            }
+            (ty @ LaneType::Evm2EvmV1_0, ev @ CcipSendRequestedEventUnion::Evm2EvmV1_2(_))
+            | (ty @ LaneType::Evm2EvmV1_2, ev @ CcipSendRequestedEventUnion::Evm2EvmV1_0(_)) => {
+                bail!("lane type mismatch: expected message of type {ty:?} but got {ev:?}",);
+            }
+        };
+        if msg_hash != msg_id {
+            bail!("hash mismatch for seq_nr {seq_nr}! we computed: {msg_hash}, event contains: {msg_id}",);
         }
 
         if let Some(&(last_seq_nr, _)) = self.seq_nrs_and_message_hashes.back() {
@@ -444,7 +489,10 @@ impl State for SourceBlessState {
 }
 
 impl OnRampReader for SourceBlessState {
-    fn get_message_hashes(&self, interval: &crate::commit_store::Interval) -> Option<Vec<Bytes32>> {
+    fn get_message_hashes(
+        &self,
+        interval: &crate::commit_store_common::Interval,
+    ) -> Option<Vec<Bytes32>> {
         let &(initial_seq_nr, _) = self.seq_nrs_and_message_hashes.front()?;
 
         let start_index = (interval.min as usize).checked_sub(initial_seq_nr as usize)?;
@@ -482,31 +530,46 @@ impl SourceBlessState {
 
 pub type SourceBlessWorker = UnstableContractEventStateMachineWorker<SourceBlessState>;
 
+#[derive(Clone, Debug)]
 pub enum DestEventUnion {
     Blessed(crate::afn_contract::TaggedRootBlessedEvent),
     BlessVotesReset(crate::afn_contract::TaggedRootBlessVotesResetEvent),
     AlreadyBlessed(crate::afn_contract::AlreadyBlessedEvent),
     Voted(crate::afn_contract::VotedToBlessEvent),
     AlreadyVoted(crate::afn_contract::AlreadyVotedToBlessEvent),
-    Committed(crate::commit_store::ReportAcceptedEvent),
+    CommittedV1_0(crate::commit_store_v1_0::ReportAcceptedEventV1_0),
+    CommittedV1_2(crate::commit_store_v1_2::ReportAcceptedEventV1_2),
+}
+#[derive(Clone)]
+pub struct VersionedDestEventFilter {
+    pub lane_type: crate::config::LaneType,
 }
 
-impl ContractEventUnion for DestEventUnion {
-    fn log_topics() -> Vec<Bytes32> {
-        vec![
+impl ContractEventFilter for VersionedDestEventFilter {
+    type ContractEventUnion = DestEventUnion;
+    fn log_topics(&self) -> Vec<Bytes32> {
+        let non_versioned_topics = vec![
             crate::afn_contract::TaggedRootBlessedEvent::log_topic(),
             crate::afn_contract::TaggedRootBlessVotesResetEvent::log_topic(),
             crate::afn_contract::AlreadyBlessedEvent::log_topic(),
             crate::afn_contract::VotedToBlessEvent::log_topic(),
             crate::afn_contract::AlreadyVotedToBlessEvent::log_topic(),
-            crate::commit_store::ReportAcceptedEvent::log_topic(),
-        ]
+        ];
+        let versioned_topics = match self.lane_type {
+            LaneType::Evm2EvmV1_0 => {
+                vec![crate::commit_store_v1_0::ReportAcceptedEventV1_0::log_topic()]
+            }
+            LaneType::Evm2EvmV1_2 => {
+                vec![crate::commit_store_v1_2::ReportAcceptedEventV1_2::log_topic()]
+            }
+        };
+        [non_versioned_topics, versioned_topics].concat()
     }
 
-    fn decode_log(log: EVMLog) -> Result<Self> {
+    fn decode_log(&self, log: EVMLog) -> Result<Self::ContractEventUnion> {
         let &topic = log
             .topics
-            .get(0)
+            .first()
             .ok_or(anyhow!("cannot decode log with empty topic"))?;
         if topic == crate::afn_contract::TaggedRootBlessedEvent::log_topic() {
             Ok(DestEventUnion::Blessed(
@@ -528,12 +591,24 @@ impl ContractEventUnion for DestEventUnion {
             Ok(DestEventUnion::AlreadyVoted(
                 crate::afn_contract::AlreadyVotedToBlessEvent::decode_log(log)?,
             ))
-        } else if topic == crate::commit_store::ReportAcceptedEvent::log_topic() {
-            Ok(DestEventUnion::Committed(
-                crate::commit_store::ReportAcceptedEvent::decode_log(log)?,
+        } else if topic == crate::commit_store_v1_0::ReportAcceptedEventV1_0::log_topic()
+            && matches!(self.lane_type, LaneType::Evm2EvmV1_0)
+        {
+            Ok(DestEventUnion::CommittedV1_0(
+                crate::commit_store_v1_0::ReportAcceptedEventV1_0::decode_log(log)?,
+            ))
+        } else if topic == crate::commit_store_v1_2::ReportAcceptedEventV1_2::log_topic()
+            && matches!(self.lane_type, LaneType::Evm2EvmV1_2)
+        {
+            Ok(DestEventUnion::CommittedV1_2(
+                crate::commit_store_v1_2::ReportAcceptedEventV1_2::decode_log(log)?,
             ))
         } else {
-            Err(anyhow!("unknown topic {:?}", topic))
+            Err(anyhow!(
+                "unknown topic {:?} for lane type {:?}",
+                topic,
+                self.lane_type
+            ))
         }
     }
 }
@@ -547,44 +622,56 @@ pub struct DestBlessState {
 
     pub my_voted_but_not_yet_blessed_roots: std::collections::HashSet<Bytes32>,
     pub blessed_roots: std::collections::HashSet<Bytes32>,
-    pub committed_roots_with_intervals: std::vec::Vec<crate::commit_report::RootWithInterval>,
+    pub committed_roots_with_intervals: std::vec::Vec<crate::commit_store_common::RootWithInterval>,
 }
 
 impl State for DestBlessState {
-    type Ev = DestEventUnion;
+    type ContractEventUnion = DestEventUnion;
+    type ContractEventFilter = VersionedDestEventFilter;
     fn update_with_event(
         &mut self,
         _block_number: u64,
         _block_hash: Bytes32,
         _address: Address,
+        filter: &Self::ContractEventFilter,
         ev: DestEventUnion,
     ) -> Result<()> {
         use crate::afn_contract::{
             AlreadyBlessedEvent, AlreadyVotedToBlessEvent, TaggedRootBlessVotesResetEvent,
             TaggedRootBlessedEvent, VotedToBlessEvent,
         };
-        use crate::commit_store::ReportAcceptedEvent;
-        match ev {
-            DestEventUnion::Blessed(TaggedRootBlessedEvent { tagged_root, .. })
-            | DestEventUnion::AlreadyBlessed(AlreadyBlessedEvent { tagged_root, .. }) => {
+        use crate::commit_store_v1_0::ReportAcceptedEventV1_0;
+        use crate::commit_store_v1_2::ReportAcceptedEventV1_2;
+        match (filter.lane_type, ev) {
+            (
+                LaneType::Evm2EvmV1_0 | LaneType::Evm2EvmV1_2,
+                DestEventUnion::Blessed(TaggedRootBlessedEvent { tagged_root, .. })
+                | DestEventUnion::AlreadyBlessed(AlreadyBlessedEvent { tagged_root, .. }),
+            ) => {
                 if tagged_root.commit_store == self.commit_store_address {
                     self.blessed_roots.insert(tagged_root.root);
                     self.my_voted_but_not_yet_blessed_roots
                         .remove(&tagged_root.root);
                 }
             }
-            DestEventUnion::Voted(VotedToBlessEvent {
-                config_version,
-                voter,
-                tagged_root,
-                ..
-            })
-            | DestEventUnion::AlreadyVoted(AlreadyVotedToBlessEvent {
-                config_version,
-                voter,
-                tagged_root,
-                ..
-            }) => {
+            (
+                LaneType::Evm2EvmV1_0 | LaneType::Evm2EvmV1_2,
+                DestEventUnion::Voted(VotedToBlessEvent {
+                    config_version,
+                    voter,
+                    tagged_root,
+                    ..
+                }),
+            )
+            | (
+                LaneType::Evm2EvmV1_0 | LaneType::Evm2EvmV1_2,
+                DestEventUnion::AlreadyVoted(AlreadyVotedToBlessEvent {
+                    config_version,
+                    voter,
+                    tagged_root,
+                    ..
+                }),
+            ) => {
                 if config_version == self.config_version
                     && voter == self.my_vote_address
                     && tagged_root.commit_store == self.commit_store_address
@@ -595,11 +682,14 @@ impl State for DestBlessState {
                     }
                 }
             }
-            DestEventUnion::BlessVotesReset(TaggedRootBlessVotesResetEvent {
-                config_version,
-                tagged_root,
-                ..
-            }) => {
+            (
+                LaneType::Evm2EvmV1_0 | LaneType::Evm2EvmV1_2,
+                DestEventUnion::BlessVotesReset(TaggedRootBlessVotesResetEvent {
+                    config_version,
+                    tagged_root,
+                    ..
+                }),
+            ) => {
                 if config_version == self.config_version
                     && tagged_root.commit_store == self.commit_store_address
                 {
@@ -608,8 +698,21 @@ impl State for DestBlessState {
                         .remove(&tagged_root.root);
                 }
             }
-            DestEventUnion::Committed(ReportAcceptedEvent { report }) => {
+            (
+                LaneType::Evm2EvmV1_0,
+                DestEventUnion::CommittedV1_0(ReportAcceptedEventV1_0 { report }),
+            ) => {
                 self.committed_roots_with_intervals.push(report.into());
+            }
+            (
+                LaneType::Evm2EvmV1_2,
+                DestEventUnion::CommittedV1_2(ReportAcceptedEventV1_2 { report }),
+            ) => {
+                self.committed_roots_with_intervals.push(report.into());
+            }
+            (ty @ LaneType::Evm2EvmV1_2, ev @ DestEventUnion::CommittedV1_0(_))
+            | (ty @ LaneType::Evm2EvmV1_0, ev @ DestEventUnion::CommittedV1_2(_)) => {
+                bail!("lane type mismatch: expected message of type {ty:?} but got {ev:?}",);
             }
         };
         Ok(())
@@ -619,7 +722,7 @@ impl State for DestBlessState {
 impl DestBlessState {
     pub fn unverified_roots_with_intervals_we_could_vote(
         &self,
-    ) -> impl Iterator<Item = (usize, &crate::commit_report::RootWithInterval)> + '_ {
+    ) -> impl Iterator<Item = (usize, &crate::commit_store_common::RootWithInterval)> + '_ {
         self.committed_roots_with_intervals
             .iter()
             .enumerate()
@@ -634,13 +737,16 @@ pub type DestBlessWorker = UnstableContractEventStateMachineWorker<DestBlessStat
 
 use crate::evm2evm_offramp::{ExecutionStateChanged, MessageExecutionState};
 
-impl ContractEventUnion for ExecutionStateChanged {
-    fn log_topics() -> Vec<Bytes32> {
-        vec![<Self as LogTopic>::log_topic()]
+#[derive(Clone)]
+pub struct SimpleExecutionStateChangedFilter;
+impl ContractEventFilter for SimpleExecutionStateChangedFilter {
+    type ContractEventUnion = ExecutionStateChanged;
+    fn log_topics(&self) -> Vec<Bytes32> {
+        vec![<Self::ContractEventUnion as LogTopic>::log_topic()]
     }
 
-    fn decode_log(log: EVMLog) -> Result<Self> {
-        <Self as DecodeLog>::decode_log(log)
+    fn decode_log(&self, log: EVMLog) -> Result<Self::ContractEventUnion> {
+        <Self::ContractEventUnion as DecodeLog>::decode_log(log)
     }
 }
 
@@ -648,7 +754,7 @@ impl ContractEventUnion for ExecutionStateChanged {
 pub enum OffRampStateAnomaly {
     DoubleExecution {
         seq_nr: u64,
-        old_message_id: Bytes32,
+        old_message_id: Option<Bytes32>,
         new_message_id: Bytes32,
         new_state: MessageExecutionState,
     },
@@ -676,33 +782,28 @@ impl DestOffRampState {
 }
 
 impl State for DestOffRampState {
-    type Ev = ExecutionStateChanged;
+    type ContractEventUnion = ExecutionStateChanged;
+    type ContractEventFilter = SimpleExecutionStateChangedFilter;
     fn update_with_event(
         &mut self,
         _block_number: u64,
         _block_hash: Bytes32,
         _address: Address,
+        _filter: &Self::ContractEventFilter,
         ev: ExecutionStateChanged,
     ) -> Result<()> {
-        let old_message_id = match self.message_id_by_sequence_number.get(&ev.sequence_number) {
-            Some(old_message_id) => {
-                if old_message_id != &ev.message_id {
-                    self.local_anomalies
-                        .push(OffRampStateAnomaly::DoubleExecution {
-                            seq_nr: ev.sequence_number,
-                            old_message_id: *old_message_id,
-                            new_message_id: ev.message_id,
-                            new_state: ev.state,
-                        });
-                }
-                Some(old_message_id)
-            }
-            None => {
-                self.message_id_by_sequence_number
-                    .insert(ev.sequence_number, ev.message_id);
-                None
-            }
-        };
+        let old_message_id = self
+            .message_id_by_sequence_number
+            .insert(ev.sequence_number, ev.message_id);
+        if old_message_id.unwrap_or(ev.message_id) != ev.message_id {
+            self.local_anomalies
+                .push(OffRampStateAnomaly::DoubleExecution {
+                    seq_nr: ev.sequence_number,
+                    old_message_id,
+                    new_message_id: ev.message_id,
+                    new_state: ev.state,
+                });
+        }
         match (
             self.successfully_executed_seq_nrs
                 .contains(ev.sequence_number as usize),
@@ -721,7 +822,6 @@ impl State for DestOffRampState {
                     state,
                 }),
             (true, new_state) => {
-                let old_message_id = *old_message_id.unwrap();
                 warn!(
                     "double execution for sequence number {} (old message id: {:?}, new message id: {:?}, new state: {:?})",
                     ev.sequence_number, old_message_id, ev.message_id, new_state
