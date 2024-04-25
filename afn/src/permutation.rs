@@ -49,7 +49,7 @@ pub fn delay(
     mode: VotingMode,
 ) -> Option<Duration> {
     match mode {
-        VotingMode::Active | VotingMode::DryRun => {
+        VotingMode::Active | VotingMode::UnreliableRemote | VotingMode::DryRun => {
             delay_with_seed(bless_vote_addr, config, current_seed())
         }
         VotingMode::Passive => Some(Duration::ZERO),

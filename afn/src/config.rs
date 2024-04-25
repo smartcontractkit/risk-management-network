@@ -1,12 +1,15 @@
-use crate::common::{ChainName, LaneId};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::{
+    common::{ChainName, LaneId},
+    forensics::LogRotateConfig,
+};
+use anyhow::{anyhow, Context, Result};
 use minieth::{bytes::Address, tx_sender::TransactionSenderFeeConfig};
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     env, fs,
     hash::Hash,
-    str::FromStr,
     time::Duration,
 };
 
@@ -34,24 +37,19 @@ pub const MIN_STATUS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 pub const CONFIG_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-pub const METRICS_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(10);
+pub const METRICS_FILE_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum Deployment {
-    Prod,
-    Beta,
-}
+pub const GAS_FEE_METRICS_UPDATE_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-impl FromStr for Deployment {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "prod" => Ok(Self::Prod),
-            "beta" => Ok(Self::Beta),
-            _ => Err(format!("unknown deployment {:?}", s)),
-        }
-    }
-}
+pub const VOTE_TO_CURSE_SEND_INTERVAL_PER_CURSE_ID: Duration = Duration::from_secs(30);
+
+pub const FORENSICS_LOGROTATE_CONFIG: LogRotateConfig = LogRotateConfig {
+    root_dir: Cow::Borrowed("./forensics"),
+    rotatable_log_file_age: Duration::from_secs(60 * 60),
+    rotatable_uncompressed_log_file_size: 5_000_000_000,
+    reapable_log_file_age: Duration::from_secs(60 * 60 * 24 * 2),
+    failed_rotate_cooldown: Duration::from_secs(60),
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
@@ -65,8 +63,8 @@ pub enum ChainStability {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChainConfig {
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct SharedChainConfig {
     pub name: ChainName,
     pub stability: ChainStability,
     pub bless_fee_config: TransactionSenderFeeConfig,
@@ -75,34 +73,8 @@ pub struct ChainConfig {
     pub afn_contract: Address,
     pub inflight_time: TimeUnit,
     pub max_fresh_block_age: TimeUnit,
-    pub rpcs: Vec<String>,
-}
-
-impl ChainConfig {
-    fn new(
-        shared_chain_config: &SharedChainConfig,
-        local_chain_config: &LocalChainConfig,
-    ) -> Result<Self> {
-        if shared_chain_config.name != local_chain_config.name {
-            bail!(
-                "inconsistent chain names from shared and local chain config: shared={} local={}",
-                shared_chain_config.name,
-                local_chain_config.name
-            )
-        }
-        Ok(Self {
-            name: shared_chain_config.name,
-            stability: shared_chain_config.stability,
-            bless_fee_config: shared_chain_config.bless_fee_config,
-            curse_fee_config: shared_chain_config.curse_fee_config,
-            max_tagged_roots_per_vote_to_bless: shared_chain_config
-                .max_tagged_roots_per_vote_to_bless,
-            afn_contract: shared_chain_config.afn_contract,
-            inflight_time: shared_chain_config.inflight_time,
-            max_fresh_block_age: shared_chain_config.max_fresh_block_age,
-            rpcs: local_chain_config.rpcs.clone(),
-        })
-    }
+    #[serde(default)]
+    pub upon_finality_violation_vote_to_curse_on_other_chains: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,7 +84,7 @@ pub enum LaneType {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LaneConfig {
+pub struct SharedLaneConfig {
     #[serde(flatten)]
     pub lane_id: LaneId,
     #[serde(alias = "type")]
@@ -140,8 +112,10 @@ impl From<(ChainName, Address)> for QualifiedAddress {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct LocalChainConfig {
+pub struct LocalChainConfig {
     pub name: ChainName,
+    #[serde(default)]
+    pub disabled: bool,
     pub rpcs: Vec<String>,
 }
 
@@ -160,88 +134,68 @@ impl From<TimeUnit> for Duration {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct SharedChainConfig {
-    pub name: ChainName,
-    pub stability: ChainStability,
-    pub bless_fee_config: TransactionSenderFeeConfig,
-    pub curse_fee_config: TransactionSenderFeeConfig,
-    pub max_tagged_roots_per_vote_to_bless: usize,
-    pub afn_contract: Address,
-    pub inflight_time: TimeUnit,
-    pub max_fresh_block_age: TimeUnit,
-}
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct LocalOffchainConfig {
     chains: Vec<LocalChainConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 struct SharedOffchainConfig {
     chains: Vec<SharedChainConfig>,
-    lanes: Vec<LaneConfig>,
+    lanes: Vec<SharedLaneConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OffchainConfig {
-    pub chains: HashMap<ChainName, ChainConfig>,
-    pub lanes: HashMap<LaneId, LaneConfig>,
+    pub shared_config_by_enabled_chain: HashMap<ChainName, SharedChainConfig>,
+    pub shared_config_by_disabled_chain: HashMap<ChainName, SharedChainConfig>,
+    pub shared_config_by_enabled_lane: HashMap<LaneId, SharedLaneConfig>,
+    pub local_config_by_enabled_chain: HashMap<ChainName, LocalChainConfig>,
 }
 
 impl OffchainConfig {
-    fn new_from_shared_and_local(
-        shared_config: SharedOffchainConfig,
-        local_config: LocalOffchainConfig,
-    ) -> Result<Self> {
-        if let Some((_, name)) = find_duplicate(&shared_config.chains, |c| c.name) {
-            return Err(anyhow!(
-                "shared_config: duplicate entry for chain {:?}",
-                name
-            ));
-        }
-        if let Some((_, name)) = find_duplicate(&local_config.chains, |c| c.name) {
-            return Err(anyhow!(
-                "local_config: duplicate entry for chain {:?}",
-                name
-            ));
-        }
-        let local_chain_configs: HashMap<ChainName, LocalChainConfig> = HashMap::from_iter(
-            local_config
-                .chains
-                .into_iter()
-                .map(|config| (config.name, config)),
-        );
-        let mut chain_configs = Vec::with_capacity(shared_config.chains.len());
-        for shared_chain_config in &shared_config.chains {
-            let local_chain_config =
-                local_chain_configs
-                    .get(&shared_chain_config.name)
-                    .ok_or(anyhow!(
-                        "local chain config not found: {}",
-                        shared_chain_config.name
-                    ))?;
-            chain_configs.push(ChainConfig::new(shared_chain_config, local_chain_config)?)
-        }
-        Self::new(chain_configs, shared_config.lanes)
-    }
-
     pub fn new(
-        chain_configs: Vec<ChainConfig>,
-        lane_configs: Vec<LaneConfig>,
+        shared_chain_configs: Vec<SharedChainConfig>,
+        shared_lane_configs: Vec<SharedLaneConfig>,
+        local_chain_configs: Vec<LocalChainConfig>,
     ) -> Result<OffchainConfig> {
-        if let Some((_, name)) = find_duplicate(&chain_configs, |c| c.name) {
-            return Err(anyhow!("duplicate entry for chain {:?}", name));
+        if let Some((_, name)) = find_duplicate(&local_chain_configs, |c| c.name) {
+            return Err(anyhow!("duplicate local config entry for chain {:?}", name));
         }
 
-        let chains: HashMap<ChainName, ChainConfig> =
-            chain_configs.into_iter().map(|c| (c.name, c)).collect();
+        let local_config_by_chain: HashMap<_, _> = local_chain_configs
+            .into_iter()
+            .map(|c| (c.name, c))
+            .collect();
 
-        if let Some((_, lane_id)) = find_duplicate(&lane_configs, |c| c.lane_id.clone()) {
+        if let Some((_, name)) = find_duplicate(&shared_chain_configs, |c| c.name) {
+            return Err(anyhow!(
+                "duplicate shared config entry for chain {:?}",
+                name
+            ));
+        }
+
+        let shared_config_by_chain: HashMap<_, _> = shared_chain_configs
+            .into_iter()
+            .map(|c| (c.name, c))
+            .collect();
+
+        for chain in local_config_by_chain.keys() {
+            if !shared_config_by_chain.contains_key(chain) {
+                return Err(anyhow!("local config entry for chain {chain:?} has no corresponding shared config entry"));
+            }
+        }
+        for chain in shared_config_by_chain.keys() {
+            if !local_config_by_chain.contains_key(chain) {
+                return Err(anyhow!("shared config entry for chain {chain:?} has no corresponding local config entry"));
+            }
+        }
+
+        if let Some((_, lane_id)) = find_duplicate(&shared_lane_configs, |c| c.lane_id.clone()) {
             return Err(anyhow!("duplicate entry for lane {:?}", lane_id));
         }
 
-        if let Some((_, qualified_commit_store)) = find_duplicate(&lane_configs, |c| {
+        if let Some((_, qualified_commit_store)) = find_duplicate(&shared_lane_configs, |c| {
             QualifiedAddress::from((c.lane_id.dest_chain_name, c.commit_store))
         }) {
             return Err(anyhow!(
@@ -250,47 +204,83 @@ impl OffchainConfig {
             ));
         }
 
-        if let Some(lane_config) = lane_configs.iter().find(|c| {
-            !(chains.contains_key(&c.lane_id.source_chain_name)
-                && chains.contains_key(&c.lane_id.dest_chain_name))
-        }) {
-            return Err(anyhow!(
-                "lane config {:?} refers to unknown chain",
-                lane_config
-            ));
+        for lane_config @ SharedLaneConfig { lane_id, .. } in &shared_lane_configs {
+            for chain in [lane_id.source_chain_name, lane_id.dest_chain_name] {
+                if !shared_config_by_chain.contains_key(&chain) {
+                    return Err(anyhow!(
+                        "lane config {:?} refers to unknown chain {:?}",
+                        lane_config,
+                        chain,
+                    ));
+                }
+            }
+
+            if lane_id.source_chain_name == lane_id.dest_chain_name {
+                return Err(anyhow!(
+                    "lane config {:?} has matching source and dest",
+                    lane_config
+                ));
+            }
         }
 
-        if let Some(lane_config) = lane_configs
-            .iter()
-            .find(|c| c.lane_id.source_chain_name == c.lane_id.dest_chain_name)
-        {
-            return Err(anyhow!(
-                "lane config {:?} has matching source and dest",
-                lane_config
-            ));
-        }
-
-        let lanes: HashMap<LaneId, LaneConfig> = lane_configs
+        let local_config_by_enabled_chain: HashMap<_, _> = local_config_by_chain
             .into_iter()
+            .filter(|(_, c)| !c.disabled)
+            .collect();
+
+        let (shared_config_by_enabled_chain, shared_config_by_disabled_chain): (
+            HashMap<_, _>,
+            HashMap<_, _>,
+        ) = shared_config_by_chain
+            .into_iter()
+            .partition(|(chain, _)| local_config_by_enabled_chain.contains_key(chain));
+
+        let shared_config_by_enabled_lane: HashMap<LaneId, SharedLaneConfig> = shared_lane_configs
+            .into_iter()
+            .filter(|c| {
+                shared_config_by_enabled_chain.contains_key(&c.lane_id.source_chain_name)
+                    && shared_config_by_enabled_chain.contains_key(&c.lane_id.dest_chain_name)
+            })
             .map(|c| (c.lane_id.clone(), c))
             .collect();
 
-        Ok(OffchainConfig { chains, lanes })
+        Ok(OffchainConfig {
+            shared_config_by_enabled_chain,
+            shared_config_by_disabled_chain,
+            shared_config_by_enabled_lane,
+            local_config_by_enabled_chain,
+        })
     }
 
-    pub fn dest_chains(&self) -> HashMap<ChainName, &ChainConfig> {
+    pub fn dest_chains(&self) -> HashMap<ChainName, &SharedChainConfig> {
         let mut h = HashMap::new();
-        for (lane_id, _) in self.lanes.iter() {
+        for (lane_id, _) in self.shared_config_by_enabled_lane.iter() {
             h.insert(
                 lane_id.dest_chain_name,
-                self.chains.get(&lane_id.dest_chain_name).unwrap(),
+                self.shared_config_by_enabled_chain
+                    .get(&lane_id.dest_chain_name)
+                    .unwrap(),
             );
         }
         h
     }
 
-    pub fn all_chains(&self) -> Vec<ChainName> {
-        self.chains.keys().copied().collect()
+    pub fn enabled_chains(&self) -> Vec<ChainName> {
+        self.shared_config_by_enabled_chain
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub fn enabled_lanes(&self) -> Vec<LaneId> {
+        self.shared_config_by_enabled_lane.keys().cloned().collect()
+    }
+
+    pub fn disabled_chains(&self) -> Vec<ChainName> {
+        self.shared_config_by_disabled_chain
+            .keys()
+            .copied()
+            .collect()
     }
 }
 
@@ -322,5 +312,9 @@ pub fn load_config_files() -> Result<OffchainConfig> {
         toml::from_str(&fs::read_to_string(config_path(SHARED_CONFIG_ENV_VAR)?)?)?;
     let local_config: LocalOffchainConfig =
         toml::from_str(&fs::read_to_string(config_path(LOCAL_CONFIG_ENV_VAR)?)?)?;
-    OffchainConfig::new_from_shared_and_local(shared_config, local_config)
+    OffchainConfig::new(
+        shared_config.chains,
+        shared_config.lanes,
+        local_config.chains,
+    )
 }

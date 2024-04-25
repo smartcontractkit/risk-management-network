@@ -3,6 +3,7 @@ use afn::{
     config::{load_config_files, OffchainConfig},
     curse_beacon::CurseId,
     encryption::EncryptedSecrets,
+    forensics::LogRotate,
     key_types::{BlessCurseKeys, BlessCurseKeysByChain},
     state,
     state::MonitorResult,
@@ -16,18 +17,19 @@ use minieth::{
 };
 use std::{
     env::{self, VarError},
-    fs, io,
+    fs::{self},
+    io::{self},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tracing::{error, warn};
-use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 
 const LOG_JSON_ENV_VAR: &str = "AFN_LOG_JSON";
 const PASSPHRASE_ENV_VAR: &str = "AFN_PASSPHRASE";
 const METRICS_FILE_PATH_ENV_VAR: &str = "AFN_METRICS_FILE";
+const CURSE_FILE_ENV_VAR: &str = "AFN_CURSE_FILE";
 
 fn user_passphrase() -> Result<String> {
     env::var(PASSPHRASE_ENV_VAR).with_context(|| {
@@ -44,13 +46,24 @@ fn metrics_file_path() -> Result<Option<PathBuf>> {
         }
     }
 }
+
+fn curse_file_path() -> Result<Option<PathBuf>> {
+    match env::var(CURSE_FILE_ENV_VAR).as_deref() {
+        Ok(path_str) => Ok(Some(PathBuf::from_str(path_str)?)),
+        Err(VarError::NotPresent) => Ok(None),
+        v => {
+            bail!("invalid value for {CURSE_FILE_ENV_VAR}: {:?}", v);
+        }
+    }
+}
+
 pub trait ExecutableCmd {
     fn execute_cmd(&self) -> Result<()>;
 }
 
 /// Ensure that we have entries in `keys` for each chain in `config`.
 fn ensure_keys_for_chains(config: &OffchainConfig, keys: &BlessCurseKeysByChain) -> bool {
-    for chain in config.all_chains() {
+    for chain in config.enabled_chains() {
         if keys.get(chain).is_none() {
             error!("no key found for {chain}");
             return false;
@@ -60,25 +73,43 @@ fn ensure_keys_for_chains(config: &OffchainConfig, keys: &BlessCurseKeysByChain)
 }
 
 fn setup_tracing() -> Result<()> {
-    let basic_subscriber = tracing_subscriber::fmt().with_env_filter(
-        EnvFilter::builder()
-            .with_default_directive(LevelFilter::INFO.into())
-            .from_env_lossy(),
-    );
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{filter, filter::LevelFilter, EnvFilter};
+
+    let forensics_layer = tracing_subscriber::fmt::layer()
+        .with_writer(Mutex::new(LogRotate::new(
+            afn::config::FORENSICS_LOGROTATE_CONFIG,
+        )?))
+        .json()
+        .flatten_event(true)
+        .with_filter(filter::Targets::new().with_targets(vec![
+            (
+                minieth::json_rpc::LOG_SPAM_FORENSICS_TARGET,
+                LevelFilter::TRACE,
+            ),
+            ("", LevelFilter::DEBUG),
+        ]));
+
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
 
     let wrap_tracing_error = |e| anyhow::anyhow!("failed to initialize tracing: {e:?}");
 
     match env::var(LOG_JSON_ENV_VAR).as_deref() {
         Ok("on") => {
-            basic_subscriber
-                .json()
-                .flatten_event(true)
+            let stdout_json_layer = tracing_subscriber::fmt::layer().json().flatten_event(true);
+            tracing_subscriber::registry()
+                .with(forensics_layer)
+                .with(stdout_json_layer.with_filter(env_filter))
                 .try_init()
                 .map_err(wrap_tracing_error)?;
         }
         Ok("off") | Err(VarError::NotPresent) => {
-            basic_subscriber
-                .compact()
+            let stdout_compact_layer = tracing_subscriber::fmt::layer().compact();
+            tracing_subscriber::registry()
+                .with(forensics_layer)
+                .with(stdout_compact_layer.with_filter(env_filter))
                 .try_init()
                 .map_err(wrap_tracing_error)?;
         }
@@ -86,6 +117,7 @@ fn setup_tracing() -> Result<()> {
             bail!("invalid value for {LOG_JSON_ENV_VAR}: {:?}", v);
         }
     }
+
     Ok(())
 }
 
@@ -93,15 +125,18 @@ fn run_afn(
     voting_mode: VotingMode,
     keystore_path: Option<String>,
     manual_curse: Option<CurseId>,
+    dangerous_allow_multiple_rpcs: bool,
+    check_rpc_pruning: bool,
+    experimental: bool,
 ) -> Result<()> {
     setup_tracing()?;
 
     let config = load_config_files()?;
 
     let keys = match voting_mode {
-        VotingMode::Active | VotingMode::DryRun => {
+        VotingMode::Active | VotingMode::UnreliableRemote | VotingMode::DryRun => {
             let path = keystore_path
-                .ok_or_else(|| anyhow!("keystore path is required in active & dryrun modes"))?;
+                .ok_or_else(|| anyhow!("keystore path is required in {voting_mode:?} mode"))?;
             let keys: BlessCurseKeysByChain = {
                 let file = fs::File::open(path)?;
                 BlessCurseKeysByChain::from_reader(file, &user_passphrase()?)?
@@ -113,7 +148,7 @@ fn run_afn(
 
             keys
         }
-        VotingMode::Passive => BlessCurseKeysByChain::generate(&config.all_chains()),
+        VotingMode::Passive => BlessCurseKeysByChain::generate(&config.enabled_chains()),
     };
 
     loop {
@@ -125,6 +160,10 @@ fn run_afn(
             voting_mode,
             manual_curse,
             metrics_file_path()?,
+            dangerous_allow_multiple_rpcs,
+            check_rpc_pruning,
+            curse_file_path()?,
+            experimental,
         )?;
         let exit_reason = state.monitor()?;
         ctx.cancel();
@@ -155,7 +194,14 @@ fn parse_manual_curse_id(s: &str) -> Result<CurseId, String> {
 #[argh(subcommand, name = "run")]
 /// run afn!
 struct Run {
-    #[argh(option, description = "voting mode")]
+    #[argh(
+        option,
+        description = "voting mode, can be (active|dryrun|passive). \
+        active: actively monitors CCIP, sends vote-to-bless and vote-to-curse transactions; \
+        dryrun: passively monitors CCIP while verifying the RMN contracts are correctly configured onchain with the addresses found in the supplied keystore, does not send transactions; \
+        passive: passively monitors CCIP, without sending bless or curse votes or requiring a keystore
+        "
+    )]
     mode: VotingMode,
     #[argh(option, description = "path to keystore file")]
     keystore: Option<String>,
@@ -168,10 +214,34 @@ struct Run {
         from_str_fn(parse_manual_curse_id)
     )]
     manual_curse: Option<CurseId>,
+    #[argh(
+        switch,
+        description = "allow more than 1 RPC endpoints configured per chain. \
+        We don't recommend having the RMN node query multiple RPC endpoints simultaneously for any chain as different RPC nodes can have conflicting chain states, causing false votes to curse. \
+        It is challenging to distinguish between discrepancies from multiple RPC endpoints and actual cursable anomalies."
+    )]
+    dangerous_allow_multiple_rpcs: bool,
+    #[argh(
+        switch,
+        description = "check on startup and on any onchain config change that rpcs have not pruned required blocks or logs. \
+        This flag can be especially useful if you just performed changes to any of your full nodes. \
+        The RMN node will fail to start if any required blocks or logs are suspected to be pruned. \
+        In case of failure it is imperative that you check your full nodes for pruning, fix the issue and rerun using this flag to verify your fix."
+    )]
+    check_rpc_pruning: bool,
+    #[argh(switch, hidden_help = true)]
+    experimental: bool,
 }
 impl ExecutableCmd for Run {
     fn execute_cmd(&self) -> Result<()> {
-        run_afn(self.mode, self.keystore.clone(), self.manual_curse)
+        run_afn(
+            self.mode,
+            self.keystore.clone(),
+            self.manual_curse,
+            self.dangerous_allow_multiple_rpcs,
+            self.check_rpc_pruning,
+            self.experimental,
+        )
     }
 }
 
@@ -203,10 +273,10 @@ struct GenKeystore {
 }
 impl ExecutableCmd for GenKeystore {
     fn execute_cmd(&self) -> Result<()> {
-        let supported_chains = load_config_files()?.all_chains();
-        eprintln!("generating keys for chains: {:?}", supported_chains);
-        let bless_curse_keys_by_chain = BlessCurseKeysByChain::generate(&supported_chains);
-        for chain_name in supported_chains {
+        let enabled_chains = load_config_files()?.enabled_chains();
+        eprintln!("generating keys for chains: {:?}", enabled_chains);
+        let bless_curse_keys_by_chain = BlessCurseKeysByChain::generate(&enabled_chains);
+        for chain_name in enabled_chains {
             let secret_keys = bless_curse_keys_by_chain
                 .get(chain_name)
                 .ok_or_else(|| anyhow!("chain not found"))?;
@@ -238,8 +308,8 @@ impl ExecutableCmd for UpdateKeystore {
             let keystore_reader = io::BufReader::new(file);
             BlessCurseKeysByChain::from_reader(keystore_reader, &user_passphrase()?)?
         };
-        let supported_chains = load_config_files()?.all_chains();
-        for &chain_name in supported_chains.iter() {
+        let enabled_chains = load_config_files()?.enabled_chains();
+        for &chain_name in enabled_chains.iter() {
             if bless_curse_keys_by_chain.get(chain_name).is_none() {
                 let secret_keys = BlessCurseKeys::generate();
                 eprintln!("generated new keys for {}: {:?}", chain_name, secret_keys,);
@@ -247,7 +317,7 @@ impl ExecutableCmd for UpdateKeystore {
             }
         }
         for chain_name in bless_curse_keys_by_chain.chains() {
-            if !supported_chains.contains(&chain_name) {
+            if !enabled_chains.contains(&chain_name) {
                 eprintln!(
                     "keystore contains keys for unsupported chain {}",
                     chain_name

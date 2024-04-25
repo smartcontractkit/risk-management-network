@@ -1,22 +1,22 @@
 use crate::{
     afn_contract::{AFNInterface, TaggedRoot},
     common::{ChainName, LaneId},
-    config::ChainConfig,
+    config::{SharedChainConfig, SharedLaneConfig},
     curse_beacon::CurseBeacon,
     inflight_root_cache::InflightRootCache,
     key_types::SecretKey,
     lane_bless_status::LaneBlessStatusWorker,
-    metrics::ChainMetrics,
+    metrics::MetricTypeCounterHandle,
     permutation::DELTA_STAGE,
     worker,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use minieth::{rpc::Rpc, tx_sender::TransactionSender};
 use std::{
     cmp::{min, Reverse},
     collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::info;
 
@@ -64,21 +64,23 @@ impl VoteToBlessWorker {
     pub fn spawn(
         ctx: &Arc<worker::Context>,
         rpc: Arc<Rpc>,
-        config: &ChainConfig,
+        config: &SharedChainConfig,
         onchain_config: crate::afn_contract::OnchainConfig,
+        lane_configs: HashMap<LaneId, SharedLaneConfig>,
         lane_bless_status_workers: HashMap<LaneId, Arc<LaneBlessStatusWorker>>,
         poll_interval: std::time::Duration,
         key: SecretKey,
         curse_beacon: Arc<CurseBeacon>,
         mode: VotingMode,
-        chain_metrics: Box<dyn ChainMetrics + Send>,
+        sent_bless_txs_handle: MetricTypeCounterHandle,
     ) -> Result<(Self, ShutdownHandle)> {
         let worker_name = format!("VoteToBlessWorker({},{})", config.name, config.afn_contract);
         let handle = ctx.spawn(worker_name, {
             let config = config.clone();
             move |ctx, worker_name| -> Result<()> {
+                let worker_name = worker_name.to_owned();
                 let bless_vote_addr = key.address();
-
+                let lane_id_by_commit_store : HashMap<_,_>= lane_configs.into_iter().map(|(lane_id,lane_config)| (lane_config.commit_store, lane_id)).collect();
                 let afn_contract =
                     AFNInterface::create_from_chain_config(Arc::clone(&rpc), &config)?;
                 let mut tx_sender = TransactionSender::new(
@@ -98,8 +100,8 @@ impl VoteToBlessWorker {
                     lane_bless_status_workers
                 };
 
-                while !ctx.is_done() && !curse_beacon.is_cursed() {
-                    let votable = Self::get_roots_to_bless(&sorted_lane_bless_status_workers);
+                ctx.repeat(worker_name.clone(), Duration::ZERO, move |ctx| {
+                    let votable = Self::get_roots_to_bless(&sorted_lane_bless_status_workers, &curse_beacon);
                     if let Some(delay) =
                         crate::permutation::delay(bless_vote_addr, &onchain_config, mode)
                     {
@@ -123,15 +125,17 @@ impl VoteToBlessWorker {
                         );
                     }
 
-                    while !ctx.is_done()
-                        && !curse_beacon.is_cursed()
-                    {
+                    while !ctx.is_done() {
                         let mut batch = Vec::new();
                         while batch.len() < config.max_tagged_roots_per_vote_to_bless {
                             if let Some(tagged_root) = queue.pop() {
-                                if votable.contains(&tagged_root) && !inflight.contains(tagged_root)
-                                {
-                                    batch.push(tagged_root);
+                                if let Some(lane_id) = lane_id_by_commit_store.get(&tagged_root.commit_store){
+                                    if votable.contains(&tagged_root) && !inflight.contains(tagged_root) && !curse_beacon.lane_is_cursed(lane_id)
+                                    {
+                                        batch.push(tagged_root);
+                                    }
+                                } else {
+                                    bail!("{worker_name}: no matching lane found for {tagged_root:?}")
                                 }
                             } else {
                                 break;
@@ -143,14 +147,14 @@ impl VoteToBlessWorker {
                         }
 
                         let txid = match mode {
-                            VotingMode::Active => Some(
+                            VotingMode::Active | VotingMode::UnreliableRemote => Some(
                                 afn_contract.send_vote_to_bless(&mut tx_sender, batch.clone())?,
                             ),
                             VotingMode::DryRun | VotingMode::Passive => None,
                         };
 
                         if txid.is_some() {
-                            chain_metrics.inc_bless_tx_counter();
+                            sent_bless_txs_handle.inc();
                         }
                         info!(
                             ?txid,
@@ -167,9 +171,10 @@ impl VoteToBlessWorker {
                         .peek()
                         .map(|(send_time, _)| send_time - Instant::now())
                         .unwrap_or(DELTA_STAGE);
-                    std::thread::sleep(min(poll_interval, until_next_send_time));
-                }
-                Ok(())
+                    ctx.sleep(min(poll_interval, until_next_send_time));
+
+                    Ok(())
+                })
             }
         });
         Ok((
@@ -182,10 +187,17 @@ impl VoteToBlessWorker {
 
     fn get_roots_to_bless(
         lane_bless_status_workers: &[(LaneId, Arc<LaneBlessStatusWorker>)],
+        curse_beacon: &CurseBeacon,
     ) -> Vec<TaggedRoot> {
         lane_bless_status_workers
             .iter()
-            .filter_map(|(_, worker)| worker.lane_bless_status.lock().unwrap().clone())
+            .filter_map(|(lane_id, worker)| {
+                if !curse_beacon.lane_is_cursed(lane_id) {
+                    worker.lane_bless_status.lock().unwrap().clone()
+                } else {
+                    None
+                }
+            })
             .flat_map(|status| status.verified_tagged_roots)
             .collect()
     }

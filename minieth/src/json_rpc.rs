@@ -1,4 +1,3 @@
-use log::error;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::min;
@@ -12,7 +11,7 @@ use thiserror::Error;
 use ureq::OrAnyStatus;
 use url::Url;
 
-#[derive(Debug, Clone, Deserialize, Error)]
+#[derive(Debug, Clone, Serialize, Deserialize, Error)]
 pub struct JsonRpcResponseError {
     pub code: i64,
     pub message: String,
@@ -25,7 +24,7 @@ impl Display for JsonRpcResponseError {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcResponse {
     Success {
@@ -227,8 +226,8 @@ impl ServerState {
     }
 }
 
-const MIN_RETRIES: u64 = 5;
-const MIN_WAIT: Duration = Duration::from_secs(60);
+const MIN_RETRIES: u64 = 2;
+const MIN_WAIT: Duration = SINGLE_REQUEST_TIMEOUT;
 const MIN_RETRY_WAIT: Duration = Duration::from_millis(250);
 
 const MAX_RESPONSE_BYTES: usize = (1_500 * 55_000) * (10 + 10 + 1) / 10;
@@ -300,6 +299,30 @@ fn better_jsonrpc_batch_result(
     }
 }
 
+pub const LOG_SPAM_FORENSICS_TARGET: &str = "_rpc_forensics";
+
+fn log_forensics(url: &str, sent: &Value, received: &Result<(u32, Vec<u8>), NetError>) {
+    match &received {
+        Ok((http_code, body)) => {
+            tracing::trace!(
+                target: LOG_SPAM_FORENSICS_TARGET,
+                url,
+                %sent,
+                http_code,
+                received = %String::from_utf8_lossy(body),
+            );
+        }
+        Err(error) => {
+            tracing::trace!(
+                target: LOG_SPAM_FORENSICS_TARGET,
+                url,
+                %sent,
+                error = %error,
+            );
+        }
+    }
+}
+
 impl JsonRpcCall for JsonRpc {
     fn call(&self, calls: &[Call]) -> Result<Vec<CallResponse>, JsonRpcError> {
         let (invocations_count, mut server_id) = {
@@ -319,8 +342,12 @@ impl JsonRpcCall for JsonRpc {
                 let encoded_payload = serde_json::to_vec(&payload)?;
                 let start = Instant::now();
                 let http_result = self.send(&server.url, &encoded_payload);
+                log_forensics(&server.url, &payload, &http_result);
+
                 let took = start.elapsed();
-                let exhausted_retries = i >= MIN_RETRIES && loop_start.elapsed() >= MIN_WAIT;
+                let tried_all_servers = i as usize >= self.servers.len();
+                let exhausted_retries =
+                    tried_all_servers && i >= MIN_RETRIES && loop_start.elapsed() >= MIN_WAIT;
                 let jsonrpc_batch_result = match http_result {
                     Ok((200, r)) => {
                         let maybe_responses: Result<Vec<JsonRpcResponse>, serde_json::Error> =
@@ -361,7 +388,7 @@ impl JsonRpcCall for JsonRpc {
                         .unwrap_or(0)
                         > 0
                 {
-                    log::warn!("[{invocations_count}] request {i} to {} with base_id={base_id} payload='{payload}' returned {jsonrpc_batch_result:?}", server.url);
+                    tracing::warn!("[{invocations_count}] request {i} to {} with base_id={base_id} payload='{payload}' returned {jsonrpc_batch_result:?}", server.url);
                 }
 
                 best_jsonrpc_batch_result =
@@ -371,7 +398,7 @@ impl JsonRpcCall for JsonRpc {
                     break best_jsonrpc_batch_result;
                 } else if let Ok(ref decoded_response) = best_jsonrpc_batch_result {
                     if count_potentially_faulty_responses(decoded_response) == 0
-                        || i as usize >= self.servers.len()
+                        || tried_all_servers
                     {
                         break best_jsonrpc_batch_result;
                     }

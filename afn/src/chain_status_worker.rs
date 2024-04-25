@@ -1,6 +1,6 @@
 use crate::chain_status::{ChainStatus, Tail};
 use crate::common::ChainName;
-use crate::metrics::ChainMetrics;
+use crate::metrics::ChainStatusMetricsHandle;
 use crate::worker::{Context, ShutdownHandle};
 use anyhow::{anyhow, bail, Result};
 use minieth::bytes::Bytes32;
@@ -11,7 +11,7 @@ use std::ops::RangeInclusive;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use tracing::{error, info, trace, warn};
+use tracing::{trace, warn};
 
 pub trait ChainStatusUpdater {
     fn initial(&self) -> Result<ChainStatus>;
@@ -64,6 +64,7 @@ impl ChainStatusUpdater for ConfirmationDepthChainStatusUpdater {
                         tracing::error!(chain=%self.name, ?tail, ?new_tail, "finality violated: confirmation depth");
                         return Ok(ChainStatus::FinalityViolated);
                     } else if new_tail_head.number < tail.stable_tip().number {
+                        warn!(chain=%self.name, ?tail, ?new_tail, "new tail rewound past tail's stable tip; ignoring new tail");
                         return Ok(ChainStatus::Good { tail: tail.clone() });
                     }
                     new_tail.push_front(
@@ -186,6 +187,7 @@ impl ChainStatusUpdater for FinalityTagChainStatusUpdater {
                         tracing::error!(chain=%self.name, ?tail, ?new_tail, ?finalized, "finality violated: conflicting finalized blocks");
                         return Ok(ChainStatus::FinalityViolated);
                     } else if new_tail_head.number < tail.stable_tip().number {
+                        warn!(chain=%self.name, ?tail, ?new_tail, "new tail rewound past tail's stable tip; ignoring new tail");
                         return Ok(ChainStatus::Good { tail: tail.clone() });
                     }
 
@@ -244,7 +246,7 @@ impl ChainStatusWorker {
         chain_name: ChainName,
         poll_interval: Duration,
         chain_status_updater: Box<dyn ChainStatusUpdater + Send>,
-        chain_metrics: Box<dyn ChainMetrics + Send>,
+        chain_status_metrics_handle: ChainStatusMetricsHandle,
     ) -> (Self, ShutdownHandle) {
         let latest_chain_status = Arc::new(RwLock::new(None));
         let worker_name = format!("ChainStatusWorker({})", chain_name);
@@ -253,60 +255,37 @@ impl ChainStatusWorker {
             let latest_chain_status = Arc::clone(&latest_chain_status);
 
             move |ctx, worker_name| -> Result<()> {
+                let worker_name = worker_name.to_owned();
+
                 let update_metrics = move |chain_status: &ChainStatus| {
                     if let Some(latest_block) = chain_status.tip() {
-                        chain_metrics.set_latest_block_number(latest_block.number);
+                        chain_status_metrics_handle
+                            .latest_block_number
+                            .set(latest_block.number as f64);
                     }
                     if let Some(finalized_block) = chain_status.stable_tip() {
-                        chain_metrics.set_finalized_block_number(finalized_block.number);
+                        chain_status_metrics_handle
+                            .finalized_block_number
+                            .set(finalized_block.number as f64);
                     }
+
+                    chain_status_metrics_handle.finality_violated.set(
+                        if matches!(chain_status, ChainStatus::FinalityViolated) {
+                            1f64
+                        } else {
+                            0f64
+                        },
+                    );
                 };
 
-                let mut chain_status = match chain_status_updater.initial() {
-                    Ok(chain_status) => {
-                        update_metrics(&chain_status);
-                        *latest_chain_status.write().unwrap() = Some(chain_status.clone());
-                        chain_status
-                    }
-                    Err(err) => {
-                        error!("{}: initialization failed with error {}", worker_name, err);
-                        return Err(err);
-                    }
-                };
-                info!(
-                    "{}: initialization finished, starting update loop",
-                    worker_name
-                );
-                let worker_name = worker_name.to_owned();
-                let mut consecutive_failures = 0;
-                ctx.repeat(poll_interval, move |ctx| {
-                    match chain_status_updater.update(ctx, &chain_status) {
-                        Ok(new_chain_status) => {
-                            update_metrics(&new_chain_status);
-                            *latest_chain_status.write().unwrap() = Some(new_chain_status.clone());
-                            chain_status = new_chain_status;
-                            consecutive_failures = 0;
-                            Ok(())
-                        }
-                        Err(err) => {
-                            consecutive_failures += 1;
-                            warn!(
-                                consecutive_failures,
-                                "{worker_name}: update failed with error {}", err
-                            );
-                            if consecutive_failures
-                                > crate::config::CHAIN_STATUS_WORKER_UPDATE_MAX_CONSECUTIVE_FAILURES
-                            {
-                                error!(
-                                    consecutive_failures,
-                                    "{worker_name}: update failed with error {}", err
-                                );
-                                Err(err)
-                            } else {
-                                Ok(())
-                            }
-                        }
-                    }
+                ctx.repeat(worker_name.clone(), poll_interval, move |ctx| {
+                    let new_chain_status = match latest_chain_status.read().unwrap().as_ref() {
+                        None => chain_status_updater.initial(),
+                        Some(chain_status) => chain_status_updater.update(ctx, chain_status),
+                    }?;
+                    update_metrics(&new_chain_status);
+                    *latest_chain_status.write().unwrap() = Some(new_chain_status);
+                    Ok(())
                 })
             }
         });

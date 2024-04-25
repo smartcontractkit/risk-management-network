@@ -18,3 +18,5 @@ bit-set = "0.5"
 rusqlite = { version = "0.30", features = ["bundled"] }
 rand = "0.8"
 rand_chacha = "0.3"
+zstd = "0.13.0"
+chrono = { version = "0.4.31", default-features = false, features = ["clock"]}

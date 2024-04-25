@@ -1,12 +1,14 @@
 use anyhow::Result;
 use std::{
     borrow::Cow,
-    sync::Mutex,
-    sync::{Arc, Condvar},
+    cmp::{max, min},
+    sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::debug;
+
+use crate::metrics::WorkerMetrics;
 
 #[derive(Debug)]
 pub struct ShutdownHandle {
@@ -95,15 +97,25 @@ impl ShutdownHandleGroup {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Context {
+    pub worker_metrics: Arc<Mutex<WorkerMetrics>>,
+
     done: Mutex<bool>,
     cvar: Condvar,
 }
 
+const MIN_POLL_DELAY_AFTER_ERROR: Duration = Duration::from_secs(1);
+const MAX_POLL_DELAY_AFTER_ERROR: Duration = Duration::from_secs(5 * 60);
+const DELAY_MULTIPLIER_AFTER_ERROR: u32 = 2;
+
 impl Context {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(Context {
+            worker_metrics: Arc::new(Mutex::new(WorkerMetrics::new())),
+            done: Default::default(),
+            cvar: Default::default(),
+        })
     }
     pub fn cancel(&self) {
         let mut done = self.done.lock().unwrap();
@@ -132,14 +144,60 @@ impl Context {
         (done, result.timed_out())
     }
 
-    pub fn repeat<F>(&self, duration: Duration, mut f: F) -> Result<()>
+    pub fn repeat<F>(
+        &self,
+        name: impl Into<Cow<'static, str>>,
+        min_interval: Duration,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(&Self) -> Result<()> + 'static,
     {
+        let worker_name = name.into();
+        let worker_metrics_handle = self
+            .worker_metrics
+            .clone()
+            .lock()
+            .unwrap()
+            .make_handle(worker_name.to_string());
+
+        let mut next_poll_delay = min_interval;
+        let mut consecutive_errors = 0;
         let mut done = self.is_done();
         while !done {
-            f(self)?;
-            (done, _) = self.sleep(duration);
+            let poll_start = Instant::now();
+            let poll_result = f(self);
+            worker_metrics_handle
+                .last_poll_duration_seconds
+                .set(poll_start.elapsed().as_secs_f64());
+            match poll_result {
+                Ok(()) => {
+                    next_poll_delay = min_interval;
+                    consecutive_errors = 0;
+                }
+                Err(e) => {
+                    next_poll_delay = min(
+                        max(
+                            MIN_POLL_DELAY_AFTER_ERROR,
+                            next_poll_delay.saturating_mul(DELAY_MULTIPLIER_AFTER_ERROR),
+                        ),
+                        MAX_POLL_DELAY_AFTER_ERROR,
+                    );
+                    worker_metrics_handle.worker_errors.inc();
+                    consecutive_errors += 1;
+                    tracing::error!(
+                        consecutive_errors,
+                        "{worker_name}: worker poll failed: {e:?}; retrying in {next_poll_delay:?}"
+                    );
+                }
+            }
+            worker_metrics_handle
+                .next_poll_delay_seconds
+                .set(next_poll_delay.as_secs() as f64);
+            worker_metrics_handle
+                .consecutive_worker_errors
+                .set(consecutive_errors as f64);
+            (done, _) = self.sleep(next_poll_delay);
         }
         Ok(())
     }
@@ -167,13 +225,17 @@ impl Context {
     pub fn spawn_repeat<F>(
         self: &Arc<Self>,
         name: impl Into<Cow<'static, str>>,
-        duration: Duration,
+        min_interval: Duration,
         f: F,
     ) -> ShutdownHandle
     where
         F: FnMut(&Self) -> Result<()> + Send + 'static,
     {
-        Self::spawn(self, name, move |ctx, _name| ctx.repeat(duration, f))
+        let name: Cow<'static, str> = name.into();
+        let worker_name = name.to_string();
+        Self::spawn(self, name, move |ctx, _name| {
+            ctx.repeat(worker_name, min_interval, f)
+        })
     }
 }
 
