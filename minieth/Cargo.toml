@@ -8,7 +8,7 @@ tiny-keccak = { version = "2", default-features = false, features = ["keccak"] }
 secp256k1 = { version = "*", features = ["global-context", "rand-std", "recovery"] }
 ureq = "2"
 url = "*"
-log = "*"
+tracing = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 quickcheck = { version = "1", optional = true }

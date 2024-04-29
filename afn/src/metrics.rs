@@ -1,5 +1,8 @@
+#![allow(clippy::new_without_default)]
+
 use anyhow::{bail, Context, Result};
 use core::hash::Hash;
+use minieth::{rpc::Rpc, tx_sender::TransactionSenderFeeConfig, u256::U256};
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -8,18 +11,21 @@ use std::{
     str::FromStr,
     sync::{Arc, Mutex},
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 const DEFAULT_METRICS_FILE_PATH: &str = "./metrics/rmn-metrics.prom";
 
 use crate::{
-    common::ChainName,
-    config::METRICS_WORKER_POLL_INTERVAL,
+    common::{ChainName, LaneId},
+    config::{
+        SharedChainConfig, GAS_FEE_METRICS_UPDATE_WORKER_POLL_INTERVAL,
+        METRICS_FILE_WORKER_POLL_INTERVAL,
+    },
     worker::{self, ShutdownHandle},
 };
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
-struct MetricLabel {
+pub struct MetricLabel {
     label_name: String,
     label_value: String,
 }
@@ -37,7 +43,7 @@ impl MetricLabel {
 }
 
 #[derive(Debug, Clone)]
-pub struct MetricSample {
+struct MetricSample {
     name: String,
     labels: Vec<MetricLabel>,
     value: f64,
@@ -87,18 +93,27 @@ fn get_help_and_type_lines_helper(
     ]
 }
 
-trait LabelKey: Hash + Eq {
+pub trait LabelKey: Hash + Eq {
     fn to_metric_labels(&self) -> Vec<MetricLabel>;
 }
 
 impl LabelKey for ChainName {
     fn to_metric_labels(&self) -> Vec<MetricLabel> {
-        vec![MetricLabel::new("chain_name", &self.to_string())]
+        vec![MetricLabel::new("chain", &self.to_string())]
+    }
+}
+impl LabelKey for LaneId {
+    fn to_metric_labels(&self) -> Vec<MetricLabel> {
+        vec![
+            MetricLabel::new("source_chain", &self.source_chain_name.to_string()),
+            MetricLabel::new("dest_chain", &self.dest_chain_name.to_string()),
+            MetricLabel::new("lane", &self.name.to_string()),
+        ]
     }
 }
 
 trait Metric<K: LabelKey> {
-    fn new(name: &str, doc_string: &str, label_keys: Vec<K>) -> Self;
+    fn new(name: &str, doc_string: &str) -> Self;
     fn help_and_type_lines(&self) -> Vec<String>;
     fn take_samples(&self) -> Vec<MetricSample>;
     fn get_prometheus_file_lines(&self) -> Vec<String> {
@@ -113,69 +128,109 @@ trait Metric<K: LabelKey> {
     }
 }
 
-struct MetricTypeCounter<K: LabelKey> {
+#[derive(Debug)]
+pub struct MetricTypeCounter<K: LabelKey> {
     name: String,
     doc_string: String,
-    counter_value_by_key: HashMap<K, u64>,
+    handle_by_key: HashMap<K, MetricTypeCounterHandle>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(Default))]
+pub struct MetricTypeCounterHandle {
+    value: Arc<Mutex<f64>>,
+}
+
+impl MetricTypeCounterHandle {
+    pub fn value(&self) -> f64 {
+        *self.value.lock().unwrap()
+    }
+
+    pub fn inc(&self) {
+        *self.value.lock().unwrap() += 1f64;
+    }
 }
 
 impl<K: LabelKey> Metric<K> for MetricTypeCounter<K> {
-    fn new(name: &str, doc_string: &str, label_keys: Vec<K>) -> Self {
+    fn new(name: &str, doc_string: &str) -> Self {
         Self {
             name: name.to_string(),
             doc_string: doc_string.to_string(),
-            counter_value_by_key: HashMap::from_iter(label_keys.into_iter().map(|k| (k, 0u64))),
+            handle_by_key: HashMap::new(),
         }
     }
     fn help_and_type_lines(&self) -> Vec<String> {
         get_help_and_type_lines_helper(&self.name, MetricType::Counter, &self.doc_string)
     }
     fn take_samples(&self) -> Vec<MetricSample> {
-        self.counter_value_by_key
+        self.handle_by_key
             .iter()
-            .map(|(k, v)| MetricSample {
+            .map(|(key, handle)| MetricSample {
                 name: self.name.clone(),
-                labels: k.to_metric_labels(),
-                value: *v as f64,
+                labels: key.to_metric_labels(),
+                value: handle.value(),
             })
             .collect()
     }
 }
 
 impl<K: LabelKey> MetricTypeCounter<K> {
-    fn increase_by(&mut self, label_key: K, inc_value: u64) {
-        match self.counter_value_by_key.get_mut(&label_key) {
-            None => {}
-            Some(value) => *value += inc_value,
+    pub fn make_handle(&mut self, label_key: K) -> MetricTypeCounterHandle {
+        match self.handle_by_key.get(&label_key) {
+            Some(handle) => handle.clone(),
+            None => {
+                let new_handle = MetricTypeCounterHandle {
+                    value: Arc::new(Mutex::new(Default::default())),
+                };
+                self.handle_by_key.insert(label_key, new_handle.clone());
+                new_handle
+            }
         }
     }
 }
 
-struct MetricTypeGauge<K: LabelKey> {
+#[derive(Debug)]
+pub struct MetricTypeGauge<K: LabelKey> {
     name: String,
     doc_string: String,
-    gauge_value_by_key: HashMap<K, Option<f64>>,
+    handle_by_key: HashMap<K, MetricTypeGaugeHandle>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(Default))]
+pub struct MetricTypeGaugeHandle {
+    value: Arc<Mutex<Option<f64>>>,
+}
+
+impl MetricTypeGaugeHandle {
+    pub fn value(&self) -> Option<f64> {
+        *self.value.lock().unwrap()
+    }
+
+    pub fn set(&self, new_value: f64) {
+        self.value.lock().unwrap().replace(new_value);
+    }
 }
 
 impl<K: LabelKey> Metric<K> for MetricTypeGauge<K> {
-    fn new(name: &str, doc_string: &str, label_keys: Vec<K>) -> Self {
+    fn new(name: &str, doc_string: &str) -> Self {
         Self {
             name: name.to_string(),
             doc_string: doc_string.to_string(),
-            gauge_value_by_key: HashMap::from_iter(label_keys.into_iter().map(|k| (k, None))),
+            handle_by_key: HashMap::new(),
         }
     }
     fn help_and_type_lines(&self) -> Vec<String> {
         get_help_and_type_lines_helper(&self.name, MetricType::Gauge, &self.doc_string)
     }
     fn take_samples(&self) -> Vec<MetricSample> {
-        self.gauge_value_by_key
+        self.handle_by_key
             .iter()
-            .filter_map(|(k, v)| {
-                v.map(|v| MetricSample {
+            .flat_map(|(key, handle)| {
+                Some(MetricSample {
                     name: self.name.clone(),
-                    labels: k.to_metric_labels(),
-                    value: v,
+                    labels: key.to_metric_labels(),
+                    value: handle.value()?,
                 })
             })
             .collect()
@@ -183,89 +238,429 @@ impl<K: LabelKey> Metric<K> for MetricTypeGauge<K> {
 }
 
 impl<K: LabelKey> MetricTypeGauge<K> {
-    fn set_value(&mut self, label_key: K, new_value: f64) {
-        match self.gauge_value_by_key.get_mut(&label_key) {
-            None => {}
-            Some(value) => *value = Some(new_value),
+    pub fn make_handle(&mut self, label_key: K) -> MetricTypeGaugeHandle {
+        match self.handle_by_key.get(&label_key) {
+            Some(handle) => handle.clone(),
+            None => {
+                let new_handle = MetricTypeGaugeHandle {
+                    value: Arc::new(Mutex::new(Default::default())),
+                };
+                self.handle_by_key.insert(label_key, new_handle.clone());
+                new_handle
+            }
         }
     }
 }
 
-struct Metrics {
-    pub bless_transaction_counter: MetricTypeCounter<ChainName>,
-    pub latest_block_number_gauge: MetricTypeGauge<ChainName>,
-    pub finalized_block_number_gauge: MetricTypeGauge<ChainName>,
+impl LabelKey for () {
+    fn to_metric_labels(&self) -> Vec<MetricLabel> {
+        Vec::new()
+    }
+}
+
+fn join_prometheus_grouped_lines_with_spacing(grouped_lines: Vec<Vec<String>>) -> Vec<String> {
+    grouped_lines
+        .into_iter()
+        .enumerate()
+        .flat_map(|(idx, v)| {
+            if idx > 0 {
+                vec![vec![String::new()], v]
+            } else {
+                vec![v]
+            }
+        })
+        .flatten()
+        .collect()
+}
+
+pub struct LaneStatusMetrics {
+    pub committed_messages: MetricTypeGauge<LaneId>,
+    pub blessed_messages: MetricTypeGauge<LaneId>,
+    pub executed_messages: MetricTypeGauge<LaneId>,
+    pub votable_messages: MetricTypeGauge<LaneId>,
+    pub voted_but_not_yet_blessed_messages: MetricTypeGauge<LaneId>,
+    pub anomalies: MetricTypeGauge<LaneId>,
+}
+
+impl LaneStatusMetrics {
+    pub fn new() -> Self {
+        let committed_messages = MetricTypeGauge::new(
+            "rmn_committed_messages",
+            "number of committed CCIP messages",
+        );
+        let blessed_messages =
+            MetricTypeGauge::new("rmn_blessed_messages", "number of blessed CCIP messages");
+        let executed_messages =
+            MetricTypeGauge::new("rmn_executed_messages", "number of executed CCIP messages");
+        let votable_messages = MetricTypeGauge::new(
+            "rmn_votable_messages",
+            "number of CCIP messages we could vote to bless",
+        );
+        let voted_but_not_yet_blessed_messages = MetricTypeGauge::new(
+            "rmn_voted_but_not_yet_blessed_messages",
+            "number of CCIP messages we have voted to bless, but are not blessed yet",
+        );
+        let anomalies = MetricTypeGauge::new("rmn_anomalies", "number of anomalies detected");
+        Self {
+            committed_messages,
+            blessed_messages,
+            executed_messages,
+            votable_messages,
+            voted_but_not_yet_blessed_messages,
+            anomalies,
+        }
+    }
+    fn get_prometheus_file_lines(&self) -> Vec<String> {
+        join_prometheus_grouped_lines_with_spacing(vec![
+            self.committed_messages.get_prometheus_file_lines(),
+            self.blessed_messages.get_prometheus_file_lines(),
+            self.executed_messages.get_prometheus_file_lines(),
+            self.votable_messages.get_prometheus_file_lines(),
+            self.voted_but_not_yet_blessed_messages
+                .get_prometheus_file_lines(),
+            self.anomalies.get_prometheus_file_lines(),
+        ])
+    }
+    pub fn make_handle(&mut self, lane_id: LaneId) -> LaneStatusMetricsHandle {
+        LaneStatusMetricsHandle {
+            committed_messages: self.committed_messages.make_handle(lane_id.clone()),
+            blessed_messages: self.blessed_messages.make_handle(lane_id.clone()),
+            executed_messages: self.executed_messages.make_handle(lane_id.clone()),
+            votable_messages: self.votable_messages.make_handle(lane_id.clone()),
+            voted_but_not_yet_blessed_messages: self
+                .voted_but_not_yet_blessed_messages
+                .make_handle(lane_id.clone()),
+            anomalies: self.anomalies.make_handle(lane_id.clone()),
+        }
+    }
+}
+
+pub type WorkerId = String;
+impl LabelKey for WorkerId {
+    fn to_metric_labels(&self) -> Vec<MetricLabel> {
+        vec![MetricLabel::new("worker", self)]
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkerMetrics {
+    pub last_poll_duration_seconds: MetricTypeGauge<WorkerId>,
+    pub next_poll_delay_seconds: MetricTypeGauge<WorkerId>,
+    pub worker_errors: MetricTypeCounter<WorkerId>,
+    pub consecutive_worker_errors: MetricTypeGauge<WorkerId>,
+}
+#[derive(Debug)]
+pub struct WorkerMetricsHandle {
+    pub last_poll_duration_seconds: MetricTypeGaugeHandle,
+    pub next_poll_delay_seconds: MetricTypeGaugeHandle,
+    pub worker_errors: MetricTypeCounterHandle,
+    pub consecutive_worker_errors: MetricTypeGaugeHandle,
+}
+
+impl WorkerMetrics {
+    pub fn new() -> Self {
+        let last_poll_duration_seconds = MetricTypeGauge::new(
+            "rmn_last_poll_duration_seconds",
+            "duration of last poll in seconds",
+        );
+        let next_poll_delay_seconds = MetricTypeGauge::new(
+            "rmn_next_poll_delay_seconds",
+            "delay until next poll in seconds",
+        );
+        let worker_errors =
+            MetricTypeCounter::new("rmn_worker_errors", "number of errors encountered");
+        let consecutive_worker_errors = MetricTypeGauge::new(
+            "rmn_consecutive_worker_errors",
+            "number of consecutive errors encountered",
+        );
+        Self {
+            last_poll_duration_seconds,
+            next_poll_delay_seconds,
+            worker_errors,
+            consecutive_worker_errors,
+        }
+    }
+    fn get_prometheus_file_lines(&self) -> Vec<String> {
+        join_prometheus_grouped_lines_with_spacing(vec![
+            self.last_poll_duration_seconds.get_prometheus_file_lines(),
+            self.next_poll_delay_seconds.get_prometheus_file_lines(),
+            self.worker_errors.get_prometheus_file_lines(),
+            self.consecutive_worker_errors.get_prometheus_file_lines(),
+        ])
+    }
+    pub fn make_handle(&mut self, worker_id: WorkerId) -> WorkerMetricsHandle {
+        WorkerMetricsHandle {
+            last_poll_duration_seconds: self
+                .last_poll_duration_seconds
+                .make_handle(worker_id.clone()),
+            next_poll_delay_seconds: self.next_poll_delay_seconds.make_handle(worker_id.clone()),
+            worker_errors: self.worker_errors.make_handle(worker_id.clone()),
+            consecutive_worker_errors: self
+                .consecutive_worker_errors
+                .make_handle(worker_id.clone()),
+        }
+    }
+}
+
+pub struct LaneStatusMetricsHandle {
+    pub committed_messages: MetricTypeGaugeHandle,
+    pub blessed_messages: MetricTypeGaugeHandle,
+    pub executed_messages: MetricTypeGaugeHandle,
+    pub votable_messages: MetricTypeGaugeHandle,
+    pub voted_but_not_yet_blessed_messages: MetricTypeGaugeHandle,
+    pub anomalies: MetricTypeGaugeHandle,
+}
+
+pub struct ChainStatusMetrics {
+    latest_block_number: MetricTypeGauge<ChainName>,
+    finalized_block_number: MetricTypeGauge<ChainName>,
+    finality_violated: MetricTypeGauge<ChainName>,
+}
+
+impl ChainStatusMetrics {
+    pub fn new() -> Self {
+        let latest_block_number =
+            MetricTypeGauge::new("rmn_latest_block_number", "block number of latest block");
+        let finalized_block_number = MetricTypeGauge::new(
+            "rmn_finalized_block_number",
+            "block number of finalized block",
+        );
+        let finality_violated = MetricTypeGauge::new(
+            "rmn_finality_violated",
+            "boolean flag (0/1) indicating whether a chain has suffered a finality violation since startup",
+        );
+        Self {
+            latest_block_number,
+            finalized_block_number,
+            finality_violated,
+        }
+    }
+    fn get_prometheus_file_lines(&self) -> Vec<String> {
+        join_prometheus_grouped_lines_with_spacing(vec![
+            self.latest_block_number.get_prometheus_file_lines(),
+            self.finalized_block_number.get_prometheus_file_lines(),
+            self.finality_violated.get_prometheus_file_lines(),
+        ])
+    }
+    pub fn make_handle(&mut self, chain_name: ChainName) -> ChainStatusMetricsHandle {
+        ChainStatusMetricsHandle {
+            latest_block_number: self.latest_block_number.make_handle(chain_name),
+            finalized_block_number: self.finalized_block_number.make_handle(chain_name),
+            finality_violated: self.finality_violated.make_handle(chain_name),
+        }
+    }
+}
+
+#[cfg_attr(test, derive(Default))]
+pub struct ChainStatusMetricsHandle {
+    pub latest_block_number: MetricTypeGaugeHandle,
+    pub finalized_block_number: MetricTypeGaugeHandle,
+    pub finality_violated: MetricTypeGaugeHandle,
+}
+
+pub struct GasFeeMetrics {
+    onchain_fee_per_gas_wei: MetricTypeGauge<ChainName>,
+    bless_max_fee_per_gas_wei: MetricTypeGauge<ChainName>,
+    curse_max_fee_per_gas_wei: MetricTypeGauge<ChainName>,
+}
+
+impl GasFeeMetrics {
+    pub fn new() -> Self {
+        let onchain_fee_per_gas_wei = MetricTypeGauge::new(
+            "rmn_onchain_fee_per_gas_wei",
+            "fee per gas (in wei) to get a tx included on chain. For EIP1559 chains this is the base fee of latest block. \
+            For non-EIP1559 (legacy) chains this is the value returned by eth_gasPrice.",
+        );
+        let bless_max_fee_per_gas_wei = MetricTypeGauge::new(
+            "rmn_bless_max_fee_per_gas_wei",
+            "configured max fee (in wei) per gas for vote to bless transactions",
+        );
+        let curse_max_fee_per_gas_wei = MetricTypeGauge::new(
+            "rmn_curse_max_fee_per_gas_wei",
+            "configured max fee (in wei) per gas for vote to curse transactions",
+        );
+        Self {
+            onchain_fee_per_gas_wei,
+            bless_max_fee_per_gas_wei,
+            curse_max_fee_per_gas_wei,
+        }
+    }
+    fn get_prometheus_file_lines(&self) -> Vec<String> {
+        join_prometheus_grouped_lines_with_spacing(vec![
+            self.onchain_fee_per_gas_wei.get_prometheus_file_lines(),
+            self.bless_max_fee_per_gas_wei.get_prometheus_file_lines(),
+            self.curse_max_fee_per_gas_wei.get_prometheus_file_lines(),
+        ])
+    }
+    pub fn make_handle(&mut self, chain_name: ChainName) -> GasFeeMetricsHandle {
+        GasFeeMetricsHandle {
+            onchain_fee_per_gas_wei: self.onchain_fee_per_gas_wei.make_handle(chain_name),
+            bless_max_fee_per_gas_wei: self.bless_max_fee_per_gas_wei.make_handle(chain_name),
+            curse_max_fee_per_gas_wei: self.curse_max_fee_per_gas_wei.make_handle(chain_name),
+        }
+    }
+}
+
+pub struct GasFeeMetricsHandle {
+    pub onchain_fee_per_gas_wei: MetricTypeGaugeHandle,
+    pub bless_max_fee_per_gas_wei: MetricTypeGaugeHandle,
+    pub curse_max_fee_per_gas_wei: MetricTypeGaugeHandle,
+}
+
+pub struct OnchainAndConfigFees {
+    pub onchain_fee_per_gas_wei: f64,
+    pub bless_max_fee_per_gas_wei: f64,
+    pub curse_max_fee_per_gas_wei: f64,
+}
+
+pub struct GasFeeMetricsUpdateWorker;
+
+impl GasFeeMetricsUpdateWorker {
+    pub fn get_onchain_and_config_fees(
+        rpc: &Rpc,
+        chain_config: &SharedChainConfig,
+    ) -> Result<OnchainAndConfigFees> {
+        match (chain_config.bless_fee_config, chain_config.curse_fee_config) {
+            (
+                TransactionSenderFeeConfig::Eip1559 {
+                    max_fee_per_gas: bless_max_fee_per_gas,
+                    max_priority_fee_per_gas: _,
+                },
+                TransactionSenderFeeConfig::Eip1559 {
+                    max_fee_per_gas: curse_max_fee_per_gas,
+                    max_priority_fee_per_gas: _,
+                },
+            ) => Ok(OnchainAndConfigFees {
+                onchain_fee_per_gas_wei: rpc
+                    .get_latest_block_base_fee_per_gas_wei()?
+                    .to_f64_lossy(),
+                bless_max_fee_per_gas_wei: U256::from(bless_max_fee_per_gas).to_f64_lossy(),
+                curse_max_fee_per_gas_wei: U256::from(curse_max_fee_per_gas).to_f64_lossy(),
+            }),
+            (
+                TransactionSenderFeeConfig::Legacy {
+                    gas_price: bless_max_gas_price,
+                },
+                TransactionSenderFeeConfig::Legacy {
+                    gas_price: curse_max_gas_price,
+                },
+            ) => Ok(OnchainAndConfigFees {
+                onchain_fee_per_gas_wei: rpc.get_gas_price_wei()?.to_f64_lossy(),
+                bless_max_fee_per_gas_wei: U256::from(bless_max_gas_price).to_f64_lossy(),
+                curse_max_fee_per_gas_wei: U256::from(curse_max_gas_price).to_f64_lossy(),
+            }),
+            _ => {
+                bail!(
+                    "inconsistent bless and curse chain config type, bless={:?} curse={:?}",
+                    chain_config.bless_fee_config,
+                    chain_config.curse_fee_config
+                )
+            }
+        }
+    }
+
+    fn wei_to_human_friendly_string(wei: f64) -> String {
+        let gwei = wei / 1e9;
+        if gwei >= 0.01 {
+            format!("{} Gwei", (gwei * 100.0).round() / 100.0)
+        } else {
+            format!("{} Wei", wei)
+        }
+    }
+
+    pub fn spawn(
+        ctx: Arc<worker::Context>,
+        chain_config: SharedChainConfig,
+        rpc: Arc<Rpc>,
+        gas_fee_metrics_handle: GasFeeMetricsHandle,
+    ) -> Result<(Self, ShutdownHandle)> {
+        let worker_name = format!("GasFeeMetricsUpdateWorker({})", chain_config.name);
+        let handle = {
+            ctx.spawn_repeat(
+                worker_name.clone(),
+                GAS_FEE_METRICS_UPDATE_WORKER_POLL_INTERVAL,
+                move |_ctx: &worker::Context| -> Result<()> {
+                    let OnchainAndConfigFees {
+                        onchain_fee_per_gas_wei,
+                        bless_max_fee_per_gas_wei,
+                        curse_max_fee_per_gas_wei,
+                    } = Self::get_onchain_and_config_fees(&rpc, &chain_config)?;
+                    gas_fee_metrics_handle
+                        .onchain_fee_per_gas_wei
+                        .set(onchain_fee_per_gas_wei);
+                    gas_fee_metrics_handle
+                        .bless_max_fee_per_gas_wei
+                        .set(bless_max_fee_per_gas_wei);
+                    gas_fee_metrics_handle
+                        .curse_max_fee_per_gas_wei
+                        .set(curse_max_fee_per_gas_wei);
+
+                    info!(
+                        onchain_fee_per_gas =
+                            Self::wei_to_human_friendly_string(onchain_fee_per_gas_wei),
+                        bless_max_fee_per_gas =
+                            Self::wei_to_human_friendly_string(bless_max_fee_per_gas_wei),
+                        curse_max_fee_per_gas =
+                            Self::wei_to_human_friendly_string(curse_max_fee_per_gas_wei),
+                        "{worker_name}: fee status"
+                    );
+                    Ok(())
+                },
+            )
+        };
+        Ok((Self, handle))
+    }
+}
+
+pub struct Metrics {
+    pub uptime_seconds: MetricTypeGauge<()>,
+    pub disabled_chains: MetricTypeGauge<()>,
+    pub sent_bless_txs: MetricTypeCounter<ChainName>,
+    pub gas_fee_metrics: GasFeeMetrics,
+    pub chain_status_metrics: ChainStatusMetrics,
+    pub lane_status_metrics: LaneStatusMetrics,
+    pub worker_metrics: Arc<Mutex<WorkerMetrics>>,
 }
 
 impl Metrics {
-    fn new(chains: Vec<ChainName>) -> Self {
-        let bless_transaction_counter = MetricTypeCounter::new(
-            "rmn_bless_tx_count",
-            "number of bless tx sent",
-            chains.clone(),
+    pub fn new(worker_metrics: Arc<Mutex<WorkerMetrics>>) -> Self {
+        let uptime_seconds = MetricTypeGauge::new(
+            "rmn_uptime_seconds",
+            "time in seconds since the node started or internally restarted due to RMN contract onchain config changes",
         );
-        let latest_block_number_gauge = MetricTypeGauge::new(
-            "rmn_latest_block_number",
-            "block number of latest block",
-            chains.clone(),
+        let disabled_chains = MetricTypeGauge::new(
+            "rmn_disabled_chains",
+            "number of chains that RMN should but does not operate with",
         );
-        let finalized_block_number_gauge = MetricTypeGauge::new(
-            "rmn_finalized_block_number",
-            "block number of finalized block",
-            chains,
-        );
+        let sent_bless_txs =
+            MetricTypeCounter::new("rmn_sent_bless_txs", "number of bless tx sent");
+        let gas_fee_metrics = GasFeeMetrics::new();
+        let chain_status_metrics = ChainStatusMetrics::new();
+        let lane_status_metrics = LaneStatusMetrics::new();
         Self {
-            bless_transaction_counter,
-            latest_block_number_gauge,
-            finalized_block_number_gauge,
+            uptime_seconds,
+            disabled_chains,
+            sent_bless_txs,
+            gas_fee_metrics,
+            chain_status_metrics,
+            lane_status_metrics,
+            worker_metrics,
         }
     }
 
-    fn get_prometheus_file_lines(&mut self) -> Vec<String> {
-        [
-            self.bless_transaction_counter.get_prometheus_file_lines(),
-            self.latest_block_number_gauge.get_prometheus_file_lines(),
-            self.finalized_block_number_gauge
+    fn get_prometheus_file_lines(&self) -> Vec<String> {
+        join_prometheus_grouped_lines_with_spacing(vec![
+            self.uptime_seconds.get_prometheus_file_lines(),
+            self.disabled_chains.get_prometheus_file_lines(),
+            self.sent_bless_txs.get_prometheus_file_lines(),
+            self.gas_fee_metrics.get_prometheus_file_lines(),
+            self.chain_status_metrics.get_prometheus_file_lines(),
+            self.lane_status_metrics.get_prometheus_file_lines(),
+            self.worker_metrics
+                .lock()
+                .unwrap()
                 .get_prometheus_file_lines(),
-        ]
-        .into_iter()
-        .flat_map(|v| [v, vec![String::new()]])
-        .flatten()
-        .collect()
-    }
-}
-
-pub trait ChainMetrics {
-    fn inc_bless_tx_counter(&self);
-    fn set_latest_block_number(&self, latest_block_number: u64);
-    fn set_finalized_block_number(&self, finalized_block_number: u64);
-}
-
-pub struct ChainMetricsHandle {
-    metrics: Arc<Mutex<Metrics>>,
-    chain_name: ChainName,
-}
-impl ChainMetrics for ChainMetricsHandle {
-    fn inc_bless_tx_counter(&self) {
-        self.metrics
-            .lock()
-            .unwrap()
-            .bless_transaction_counter
-            .increase_by(self.chain_name, 1)
-    }
-    fn set_latest_block_number(&self, latest_block_number: u64) {
-        self.metrics
-            .lock()
-            .unwrap()
-            .latest_block_number_gauge
-            .set_value(self.chain_name, latest_block_number as f64)
-    }
-    fn set_finalized_block_number(&self, finalized_block_number: u64) {
-        self.metrics
-            .lock()
-            .unwrap()
-            .finalized_block_number_gauge
-            .set_value(self.chain_name, finalized_block_number as f64)
+        ])
     }
 }
 
@@ -285,17 +680,14 @@ fn ensure_writable_file(path: impl AsRef<Path>) -> Result<()> {
         .with_context(|| format!("file {:?} is not writable", path.as_ref()))
 }
 
-pub struct MetricsWorker {
-    metrics: Arc<Mutex<Metrics>>,
-}
-impl MetricsWorker {
+pub struct MetricsFileWorker {}
+impl MetricsFileWorker {
     pub fn spawn(
         ctx: Arc<worker::Context>,
-        chains: Vec<ChainName>,
+        metrics: Metrics,
         metrics_file_path: Option<PathBuf>,
     ) -> Result<(Self, ShutdownHandle)> {
-        let metrics = Arc::new(Mutex::new(Metrics::new(chains)));
-        let worker_name = "MetricsWorker";
+        let worker_name = "MetricsFileWorker";
         let (metrics_file_path, metrics_temp_file_path) = {
             let metrics_file_path = match metrics_file_path {
                 Some(file_path) => file_path,
@@ -311,33 +703,27 @@ impl MetricsWorker {
                 bail!("metrics path {:?} is not a file path", metrics_file_path);
             }
         };
+
         let handle = {
-            let metrics = Arc::clone(&metrics);
             ctx.spawn_repeat(
                 worker_name,
-                METRICS_WORKER_POLL_INTERVAL,
+                METRICS_FILE_WORKER_POLL_INTERVAL,
                 move |_ctx: &worker::Context| -> Result<()> {
                     let mut temp_file = File::create(&metrics_temp_file_path)?;
-                    let file_lines = metrics.lock().unwrap().get_prometheus_file_lines();
+                    let file_lines = metrics.get_prometheus_file_lines();
                     debug!(
                         "{worker_name}: writing {} lines to metric file {}",
                         file_lines.len(),
                         metrics_file_path.display(),
                     );
                     temp_file.write_all(file_lines.join("\n").as_bytes())?;
+                    temp_file.write_all(b"\n")?;
                     temp_file.flush()?;
                     fs::rename(&metrics_temp_file_path, &metrics_file_path)?;
                     Ok(())
                 },
             )
         };
-        Ok((Self { metrics }, handle))
-    }
-
-    pub fn make_chain_metrics_handle(&self, chain_name: ChainName) -> ChainMetricsHandle {
-        ChainMetricsHandle {
-            metrics: Arc::clone(&self.metrics),
-            chain_name,
-        }
+        Ok((Self {}, handle))
     }
 }

@@ -256,8 +256,6 @@ fn keep_updating_until_complete_or_shutdown_request<S: State + Send + 'static>(
     Ok(())
 }
 
-const MAX_UNSTABLE_UPDATE_CONSECUTIVE_FAILS: u64 = 10;
-
 impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S> {
     pub fn spawn(
         ctx: &Arc<worker::Context>,
@@ -284,10 +282,9 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
                     chain_stability,
                     worker_name,
                 )?;
-                let mut unstable_update_consecutive_fails = 0;
                 let mut reported_initial_sync = false;
                 let worker_name = worker_name.to_owned();
-                ctx.repeat(poll_interval, move |ctx| {
+                ctx.repeat(worker_name.clone(), poll_interval, move |ctx| {
                     if let Some(chain_status) = chain_status_worker.latest_chain_status() {
                         let start_sync = Instant::now();
                         keep_updating_until_complete_or_shutdown_request(
@@ -316,18 +313,11 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
                             Finality::Unstable,
                         ) {
                             Ok(_) => {
-                                unstable_update_consecutive_fails = 0;
                                 unstable_cesm.fork_from(&new_unstable_cesm).unwrap();
                             }
                             Err(e) => {
-                                unstable_update_consecutive_fails += 1;
-                                warn!("{worker_name} unstable update failed ({unstable_update_consecutive_fails} consecutive time(s)): {e:#}");
-                                if unstable_update_consecutive_fails
-                                    > MAX_UNSTABLE_UPDATE_CONSECUTIVE_FAILS
-                                {
-                                    return Err(e)
-                                .with_context(|| format!("{worker_name} unstable update failed {unstable_update_consecutive_fails} consecutive times"));
-                                }
+                                return Err(e)
+                                    .with_context(|| format!("{worker_name} unstable update"));
                             }
                         }
                     } else {

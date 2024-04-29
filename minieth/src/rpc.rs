@@ -256,10 +256,21 @@ impl From<GetTransactionCountCall> for Call {
     }
 }
 
+pub struct ChainIdCall();
+
+impl From<ChainIdCall> for Call {
+    fn from(_: ChainIdCall) -> Self {
+        Call {
+            method: "eth_chainId".into(),
+            params: vec![],
+        }
+    }
+}
+
 pub struct FeeHistoryCall {
-    block_count: U256,
-    newest_block: BlockIdentifier,
-    reward_percentiles: Vec<u64>,
+    pub block_count: U256,
+    pub newest_block: BlockIdentifier,
+    pub reward_percentiles: Vec<u64>,
 }
 
 impl From<FeeHistoryCall> for Call {
@@ -274,27 +285,21 @@ impl From<FeeHistoryCall> for Call {
         }
     }
 }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseFeePerGasInGetBlockResponse {
+    pub base_fee_per_gas: U256,
+}
 
-pub struct ChainIdCall();
-
-impl From<ChainIdCall> for Call {
-    fn from(_: ChainIdCall) -> Self {
+pub struct GasPriceCall();
+impl From<GasPriceCall> for Call {
+    fn from(_: GasPriceCall) -> Self {
         Call {
-            method: "eth_chainId".into(),
+            method: "eth_gasPrice".into(),
             params: vec![],
         }
     }
 }
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FeeHistoryResponse {
-    oldest_block: U256,
-    base_fee_per_gas: Vec<U256>,
-    reward: Vec<Vec<U256>>,
-}
-
-const MAX_ATTEMPTS_UNTIL_FOUND: u64 = 10;
 
 fn parse_get_block_response(call_response: CallResponse) -> Result<Block, RpcError> {
     match call_response {
@@ -332,25 +337,16 @@ impl BlockRpc for Rpc {
         &self,
         identifiers: &[BlockIdentifier],
     ) -> Result<Vec<Result<Block, RpcError>>, RpcError> {
-        let mut attempts = 0;
-        loop {
-            let block_results = self
-                .batch_call(
-                    identifiers
-                        .iter()
-                        .map(|&identifier| GetBlockCall { identifier }.into())
-                        .collect::<Vec<_>>(),
-                )?
-                .into_iter()
-                .map(parse_get_block_response)
-                .collect::<Vec<_>>();
-            attempts += 1;
-            if block_results.iter().any(Result::is_err) && attempts < MAX_ATTEMPTS_UNTIL_FOUND {
-                continue;
-            } else {
-                break Ok(block_results);
-            }
-        }
+        Ok(self
+            .batch_call(
+                identifiers
+                    .iter()
+                    .map(|&identifier| GetBlockCall { identifier }.into())
+                    .collect::<Vec<_>>(),
+            )?
+            .into_iter()
+            .map(parse_get_block_response)
+            .collect::<Vec<_>>())
     }
 }
 
@@ -422,49 +418,37 @@ impl Rpc {
                 from_block, to_block
             )));
         }
-        let mut attempts = 0;
-        loop {
-            let batch_responses: Result<[_; 3], _> = self
-                .batch_call(vec![
-                    GetBlockCall {
-                        identifier: BlockIdentifier::Height(from_block),
-                    }
-                    .into(),
-                    GetBlockCall {
-                        identifier: BlockIdentifier::Height(to_block),
-                    }
-                    .into(),
-                    GetLogsCall {
-                        from_block,
-                        to_block,
-                        addresses: addresses.to_vec(),
-                        first_topics: first_topics.to_vec(),
-                    }
-                    .into(),
-                ])?
-                .try_into();
-            attempts += 1;
-            match batch_responses {
-                Ok([from_block_response, to_block_response, get_logs_response]) => {
-                    match (
-                        parse_get_block_response(from_block_response),
-                        parse_get_block_response(to_block_response),
-                        parse_get_logs_response(get_logs_response),
-                    ) {
-                        (_, _, Err(e)) | (Err(e), _, _) | (_, Err(e), _) => {
-                            if attempts < MAX_ATTEMPTS_UNTIL_FOUND {
-                                continue;
-                            } else {
-                                break Err(e);
-                            }
-                        }
-                        (Ok(_), Ok(_), Ok(logs)) => {
-                            break Ok(logs);
-                        }
-                    }
+        let batch_responses: Result<[_; 3], _> = self
+            .batch_call(vec![
+                GetBlockCall {
+                    identifier: BlockIdentifier::Height(from_block),
                 }
-                Err(_) => break Err(JsonRpcError::IncompleteBatch.into()),
+                .into(),
+                GetBlockCall {
+                    identifier: BlockIdentifier::Height(to_block),
+                }
+                .into(),
+                GetLogsCall {
+                    from_block,
+                    to_block,
+                    addresses: addresses.to_vec(),
+                    first_topics: first_topics.to_vec(),
+                }
+                .into(),
+            ])?
+            .try_into();
+        match batch_responses {
+            Ok([from_block_response, to_block_response, get_logs_response]) => {
+                match (
+                    parse_get_block_response(from_block_response),
+                    parse_get_block_response(to_block_response),
+                    parse_get_logs_response(get_logs_response),
+                ) {
+                    (_, _, Err(e)) | (Err(e), _, _) | (_, Err(e), _) => Err(e),
+                    (Ok(_), Ok(_), Ok(logs)) => Ok(logs),
+                }
             }
+            Err(_) => Err(JsonRpcError::IncompleteBatch.into()),
         }
     }
 
@@ -485,8 +469,19 @@ impl Rpc {
         .into())
     }
 
-    pub fn fee_history(&self, call: FeeHistoryCall) -> Result<FeeHistoryResponse, RpcError> {
-        Ok(serde_json::from_value(self.call_one(call)?)?)
+    pub fn get_latest_block_base_fee_per_gas_wei(&self) -> Result<U256, RpcError> {
+        Ok(
+            serde_json::from_value::<BaseFeePerGasInGetBlockResponse>(self.call_one(
+                GetBlockCall {
+                    identifier: BlockIdentifier::Latest,
+                },
+            )?)?
+            .base_fee_per_gas,
+        )
+    }
+
+    pub fn get_gas_price_wei(&self) -> Result<U256, RpcError> {
+        Ok(serde_json::from_value(self.call_one(GasPriceCall())?)?)
     }
 
     pub(crate) fn estimate_gas(

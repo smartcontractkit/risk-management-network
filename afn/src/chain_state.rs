@@ -4,8 +4,8 @@ use crate::{
         FinalityTagChainStatusUpdater,
     },
     common::ChainName,
-    config::{ChainConfig, ChainStability},
-    metrics::ChainMetrics,
+    config::{ChainStability, SharedChainConfig},
+    metrics::{ChainStatusMetricsHandle, GasFeeMetricsHandle, GasFeeMetricsUpdateWorker},
     worker::{self, ShutdownHandleGroup},
 };
 use anyhow::Result;
@@ -18,14 +18,16 @@ pub struct ChainState {
     pub name: ChainName,
     pub chain_status_worker: Arc<ChainStatusWorker>,
     pub config_discovery_worker: Arc<OnchainConfigDiscoveryWorker>,
+    pub gas_fee_metrics_update_worker: Arc<GasFeeMetricsUpdateWorker>,
 }
 
 impl ChainState {
     pub fn new_and_spawn_workers(
         ctx: &Arc<worker::Context>,
         rpc: Arc<Rpc>,
-        config: &ChainConfig,
-        chain_metrics: Box<dyn ChainMetrics + Send>,
+        config: &SharedChainConfig,
+        chain_status_metrics_handle: ChainStatusMetricsHandle,
+        gas_fee_metrics_handle: GasFeeMetricsHandle,
     ) -> Result<(Self, ShutdownHandleGroup)> {
         let mut shutdown_handles = ShutdownHandleGroup::default();
         let chain_status_worker = {
@@ -54,7 +56,7 @@ impl ChainState {
                 config.name,
                 crate::config::CHAIN_STATUS_WORKER_POLL_INTERVAL,
                 chain_status_updater,
-                chain_metrics,
+                chain_status_metrics_handle,
             ))
         };
         let config_discovery_worker = shutdown_handles.add(OnchainConfigDiscoveryWorker::spawn(
@@ -63,11 +65,18 @@ impl ChainState {
             config,
             crate::config::ONCHAIN_CONFIG_DISCOVERY_WORKER_POLL_INTERVAL,
         )?);
+        let gas_fee_metrics_update_worker = shutdown_handles.add(GasFeeMetricsUpdateWorker::spawn(
+            Arc::clone(ctx),
+            config.to_owned(),
+            rpc,
+            gas_fee_metrics_handle,
+        )?);
         Ok((
             Self {
                 name: config.name,
                 chain_status_worker: Arc::new(chain_status_worker),
                 config_discovery_worker: Arc::new(config_discovery_worker),
+                gas_fee_metrics_update_worker: Arc::new(gas_fee_metrics_update_worker),
             },
             shutdown_handles,
         ))

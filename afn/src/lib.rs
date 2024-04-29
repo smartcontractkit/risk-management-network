@@ -25,6 +25,7 @@ mod evm2evm_offramp;
 mod evm2evm_onramp_v1_0;
 mod evm2evm_onramp_v1_2;
 mod evm_common_types;
+pub mod forensics;
 mod hashable;
 mod inflight_root_cache;
 pub mod key_types;

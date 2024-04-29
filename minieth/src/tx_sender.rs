@@ -95,7 +95,7 @@ impl TransactionSender {
                 .rpc
                 .get_transaction_count(self.signer.address(), BlockIdentifier::Pending)?;
             let txs_inflight = pending_transaction_count.saturating_sub(latest_transaction_count);
-            log::trace!(
+            tracing::trace!(
                 "txs inflight: {}, chain id: {}, from: {}",
                 txs_inflight,
                 self.chain_id,
@@ -124,7 +124,7 @@ impl TransactionSender {
             let nonce = match self.nonce {
                 Some(nonce) => {
                     if txs_inflight > MAX_TXS_INFLIGHT {
-                        log::warn!(
+                        tracing::warn!(
                             "skipping sending tx and retrying, too many txs inflight (nonces: {}..={}, total: {}, max: {}) chain id: {}, from: {}, remaining time: {:?}",
                             latest_transaction_count,
                             pending_transaction_count,
@@ -153,7 +153,7 @@ impl TransactionSender {
                     tx_req.gas,
                 ),
                 Err(err) => {
-                    log::error!("eth_estimateGas for tx request: {tx_req:?}, chain id: {}, from: {}, failed with error: {err:?}", self.chain_id, self.signer.address());
+                    tracing::error!("eth_estimateGas for tx request: {tx_req:?}, chain id: {}, from: {}, failed with error: {err:?}", self.chain_id, self.signer.address());
                     if can_retry() {
                         continue;
                     } else {
@@ -162,7 +162,7 @@ impl TransactionSender {
                 }
             };
 
-            log::debug!(
+            tracing::debug!(
                 "using gas {gas} for tx request: {tx_req:?}, chain id: {}, from: {}",
                 self.chain_id,
                 self.signer.address(),
@@ -199,7 +199,7 @@ impl TransactionSender {
             };
             match self.rpc.send_raw_transaction(tx_bytes.into()) {
                 Ok(txid) => {
-                    log::debug!(
+                    tracing::debug!(
                         "used nonce: {}, chain id: {}, from: {}",
                         nonce,
                         self.chain_id,
@@ -213,7 +213,7 @@ impl TransactionSender {
                         .rpc
                         .get_transaction_count(self.signer.address(), BlockIdentifier::Pending)?;
                     self.nonce.replace(new_nonce);
-                    log::warn!(
+                    tracing::warn!(
                         "attempt to send transaction with chain id: {}, from: {}, nonce: {nonce}, remaining time: {:?} failed with retriable error: {err:?}, new nonce: {new_nonce}",
                         self.chain_id,
                         self.signer.address(),

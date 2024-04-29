@@ -44,7 +44,7 @@ impl OffRampAnomalyDetector {
     ) -> (Self, ShutdownHandle) {
         let worker_name = format!("OffRampAnomalyDetector({lane_id})");
         let state = Arc::new(RwLock::new(initial_state));
-        let handle = ctx.spawn_repeat(worker_name.clone(),crate::config::OFFRAMP_ANOMALY_DETECTOR_POLL_INTERVAL, {
+        let handle = ctx.spawn_repeat(worker_name.clone(), crate::config::OFFRAMP_ANOMALY_DETECTOR_POLL_INTERVAL, {
             let source_bless_worker = Arc::clone(&source_bless_worker);
             let dest_offramp_worker = Arc::clone(&dest_offramp_worker);
             let state = Arc::clone(&state);

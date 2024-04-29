@@ -1,5 +1,5 @@
 use crate::common::{ContractCall, EncodeContractCall, LogSignature, UncheckedDecodeLog};
-use crate::config::ChainConfig;
+use crate::config::SharedChainConfig;
 use anyhow::{anyhow, Result};
 use miniabi::abi_encode::AbiEncode;
 use miniabi::{
@@ -335,7 +335,7 @@ pub struct AFNInterface {
 }
 
 impl AFNInterface {
-    pub fn create_from_chain_config(rpc: Arc<Rpc>, config: &ChainConfig) -> Result<Self> {
+    pub fn create_from_chain_config(rpc: Arc<Rpc>, config: &SharedChainConfig) -> Result<Self> {
         Ok(AFNInterface {
             address: config.afn_contract,
             rpc,

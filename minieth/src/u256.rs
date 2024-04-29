@@ -37,6 +37,12 @@ impl U256 {
         buf[16..32].copy_from_slice(&self.lo.to_be_bytes());
         buf
     }
+
+    pub fn to_f64_lossy(&self) -> f64 {
+        let float_hi = (self.hi as f64) * 128.0_f64.exp2();
+        let float_low = self.lo as f64;
+        float_hi + float_low
+    }
 }
 
 impl fmt::Display for U256 {
