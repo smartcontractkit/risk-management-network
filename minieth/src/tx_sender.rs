@@ -146,7 +146,7 @@ impl TransactionSender {
                 self.signer.address(),
                 tx_req.to,
                 tx_req.data.clone(),
-                BlockIdentifier::Pending,
+                BlockIdentifier::Latest,
             ) {
                 Ok(gas_estimate) => std::cmp::max(
                     gas_estimate.saturating_mul(100 + ETH_ESTIMATEGAS_OVERESTIMATE_PERCENT) / 100,

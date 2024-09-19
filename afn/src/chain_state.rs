@@ -1,7 +1,7 @@
 use crate::{
     chain_status_worker::{
         ChainStatusUpdater, ChainStatusWorker, ConfirmationDepthChainStatusUpdater,
-        FinalityTagChainStatusUpdater,
+        FinalityTagChainStatusUpdater, PolkadotGetFinalizedHeadChainStatusUpdater,
     },
     common::ChainName,
     config::{ChainStability, SharedChainConfig},
@@ -41,14 +41,16 @@ impl ChainState {
                         soft_confirmations: soft_confirmations as usize,
                         hard_confirmations: hard_confirmations as usize,
                         rpc,
-                        name: config.name,
                     }),
                     ChainStability::FinalityTag {
                         soft_confirmations: _,
-                    } => Box::new(FinalityTagChainStatusUpdater {
-                        name: config.name,
-                        rpc,
-                    }),
+                    } => Box::new(FinalityTagChainStatusUpdater { rpc }),
+                    ChainStability::PolkadotGetFinalizedHead => {
+                        Box::new(PolkadotGetFinalizedHeadChainStatusUpdater {
+                            polkadot_rpc: rpc.clone(),
+                            rpc,
+                        })
+                    }
                 }
             };
             shutdown_handles.add(ChainStatusWorker::spawn(

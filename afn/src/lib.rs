@@ -5,16 +5,18 @@
 #![allow(clippy::if_same_then_else)]
 #![allow(rustdoc::private_intra_doc_links)]
 
-mod afn_contract;
+pub mod afn_contract;
+mod afn_contract_v1_0;
+mod afn_contract_v1_5;
 pub mod afn_voting_manager;
 mod cached_rpc;
 mod chain_selector;
 mod chain_state;
 mod chain_status;
 mod chain_status_worker;
-mod commit_store_common;
-mod commit_store_v1_0;
+mod commit_store;
 mod commit_store_v1_2;
+mod commit_store_v1_5;
 pub mod common;
 pub mod config;
 mod config_sanity_check;
@@ -22,8 +24,11 @@ mod contract_event_state_machine;
 pub mod curse_beacon;
 pub mod encryption;
 mod evm2evm_offramp;
-mod evm2evm_onramp_v1_0;
+mod evm2evm_offramp_v1_2;
+mod evm2evm_offramp_v1_5;
+mod evm2evm_onramp;
 mod evm2evm_onramp_v1_2;
+mod evm2evm_onramp_v1_5;
 mod evm_common_types;
 pub mod forensics;
 mod hashable;

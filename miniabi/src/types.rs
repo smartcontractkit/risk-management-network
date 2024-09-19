@@ -1,5 +1,5 @@
 use minieth::{
-    bytes::{Address, Bytes, Bytes32},
+    bytes::{Address, Bytes, Bytes16, Bytes32},
     u256::U256,
 };
 
@@ -14,6 +14,7 @@ pub enum Type {
     U16,
     U8,
     Address,
+    Bytes16,
     Bytes32,
     Bytes,
     String,
@@ -35,6 +36,7 @@ impl Type {
             | Type::U16
             | Type::U8
             | Type::Address
+            | Type::Bytes16
             | Type::Bytes32 => true,
             Type::Bytes | Type::String | Type::DynamicArray(_) => false,
             Type::Tuple(tuple) => Self::all_static(tuple),
@@ -53,6 +55,7 @@ pub enum Value {
     U16(u16),
     U8(u8),
     Address(Address),
+    Bytes16(Bytes16),
     Bytes32(Bytes32),
     Bytes(Bytes),
     String(String),
@@ -73,6 +76,7 @@ impl Value {
             | Self::U16(_)
             | Self::U8(_)
             | Self::Address(_)
+            | Self::Bytes16(_)
             | Self::Bytes32(_) => true,
             Self::Bytes(_) | Self::String(_) | Self::DynamicArray(_) => false,
             Self::Tuple(tuple) => Self::all_static(tuple),

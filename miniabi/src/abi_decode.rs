@@ -1,6 +1,6 @@
 use crate::types::{Type, Value};
 use minieth::{
-    bytes::{Address, Bytes, Bytes32},
+    bytes::{Address, Bytes, Bytes16, Bytes32},
     u256::U256,
 };
 use std::convert::TryFrom;
@@ -20,6 +20,8 @@ pub enum AbiDecodeError {
     InvalidUsizeEncoding,
     #[error("invalid address encoding")]
     InvalidAddressEncoding,
+    #[error("invalid bytes<N> encoding")]
+    InvalidBytesNEncoding,
     #[error("invalid bytes encoding")]
     InvalidBytesEncoding,
     #[error("invalid string encoding")]
@@ -65,6 +67,7 @@ impl_into_type_to_decode_prim_type!(u32, U32);
 impl_into_type_to_decode_prim_type!(u16, U16);
 impl_into_type_to_decode_prim_type!(u8, U8);
 impl_into_type_to_decode_prim_type!(Address, Address);
+impl_into_type_to_decode_prim_type!(Bytes16, Bytes16);
 impl_into_type_to_decode_prim_type!(Bytes32, Bytes32);
 impl_into_type_to_decode_prim_type!(Bytes, Bytes);
 impl_into_type_to_decode_prim_type!(String, String);
@@ -93,6 +96,7 @@ impl_into_type_to_decode_tuple!(A, B, C, D,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E, F,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G,);
+impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G, H,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G, H, I,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G, H, I, J, K, L,);
 impl_into_type_to_decode_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M,);
@@ -120,6 +124,7 @@ impl_try_from_decoded_value_prim_type!(u32, U32);
 impl_try_from_decoded_value_prim_type!(u16, U16);
 impl_try_from_decoded_value_prim_type!(u8, U8);
 impl_try_from_decoded_value_prim_type!(Address, Address);
+impl_try_from_decoded_value_prim_type!(Bytes16, Bytes16);
 impl_try_from_decoded_value_prim_type!(Bytes32, Bytes32);
 impl_try_from_decoded_value_prim_type!(Bytes, Bytes);
 impl_try_from_decoded_value_prim_type!(String, String);
@@ -165,6 +170,17 @@ impl_try_from_decoded_value_tuple!(4, (A, 0), (B, 1), (C, 2), (D, 3),);
 impl_try_from_decoded_value_tuple!(5, (A, 0), (B, 1), (C, 2), (D, 3), (E, 4),);
 impl_try_from_decoded_value_tuple!(6, (A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5),);
 impl_try_from_decoded_value_tuple!(7, (A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6),);
+impl_try_from_decoded_value_tuple!(
+    8,
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+);
 impl_try_from_decoded_value_tuple!(
     9,
     (A, 0),

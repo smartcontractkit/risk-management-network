@@ -1,6 +1,6 @@
 use crate::types::Value;
 use minieth::{
-    bytes::{Address, Bytes, Bytes32},
+    bytes::{Address, Bytes, Bytes16, Bytes32},
     u256::U256,
 };
 
@@ -40,6 +40,7 @@ value_to_encode_impl_from_prim_type!(u32, U32);
 value_to_encode_impl_from_prim_type!(u16, U16);
 value_to_encode_impl_from_prim_type!(u8, U8);
 value_to_encode_impl_from_prim_type!(Address, Address);
+value_to_encode_impl_from_prim_type!(Bytes16, Bytes16);
 value_to_encode_impl_from_prim_type!(Bytes32, Bytes32);
 value_to_encode_impl_from_prim_type!(Bytes, Bytes);
 value_to_encode_impl_from_prim_type!(String, String);

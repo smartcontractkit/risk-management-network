@@ -5,6 +5,7 @@ use crate::{
     key_types::BlessCurseKeys,
     lane_bless_status::LaneBlessStatusWorker,
     metrics::MetricTypeCounterHandle,
+    onchain_config_discovery_worker::OnchainConfigDiscoveryWorker,
     vote_to_bless_worker::VoteToBlessWorker,
     vote_to_curse_worker::VoteToCurseWorker,
     worker::ShutdownHandleGroup,
@@ -58,6 +59,7 @@ impl AFNVotingManager {
         mode: VotingMode,
         sent_bless_txs_handle: MetricTypeCounterHandle,
         curse_file: Option<Arc<Mutex<File>>>,
+        onchain_config_discovery_worker: Arc<OnchainConfigDiscoveryWorker>,
     ) -> Result<(Self, ShutdownHandleGroup)> {
         let mut shutdown_handles = ShutdownHandleGroup::default();
         let vote_to_bless_worker = shutdown_handles.add(VoteToBlessWorker::spawn(
@@ -82,6 +84,7 @@ impl AFNVotingManager {
             Arc::clone(&curse_beacon),
             mode,
             curse_file,
+            onchain_config_discovery_worker,
         )?);
         Ok((
             Self {

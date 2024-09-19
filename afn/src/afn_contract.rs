@@ -1,45 +1,53 @@
 use crate::common::{ContractCall, EncodeContractCall, LogSignature, UncheckedDecodeLog};
 use crate::config::SharedChainConfig;
-use anyhow::{anyhow, Result};
-use miniabi::abi_encode::AbiEncode;
+use crate::curse_beacon::CurseType;
+use crate::{
+    afn_contract_v1_0::{get_vote_to_curse_call_and_gas_limit_v1_0, OnchainConfigV1_0, VoterV1_0},
+    afn_contract_v1_5::{get_vote_to_curse_call_and_gas_limit_v1_5, OnchainConfigV1_5, VoterV1_5},
+};
+use anyhow::{anyhow, bail, Result};
 use miniabi::{
     abi_decode::{AbiDecode, AbiDecodeError, AbiTypeToDecode},
+    abi_encode::AbiEncode,
     types::{Type, Value},
 };
 use minieth::{
-    bytes::{Address, Bytes, Bytes32},
+    bytes::{Address, Bytes, Bytes16, Bytes32},
     keccak::keccak256,
     rpc::{EVMLog, Rpc},
     tx_sender::{TransactionRequest, TransactionSender},
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Voter {
     pub bless_vote_addr: Address,
     pub curse_vote_addr: Address,
-    pub curse_unvote_addr: Address,
+    pub curse_unvote_addr: Option<Address>,
     pub bless_weight: u8,
     pub curse_weight: u8,
 }
-type VoterAsTuple = (Address, Address, Address, u8, u8);
-impl AbiTypeToDecode for Voter {
-    fn abi_type_to_decode() -> Type {
-        VoterAsTuple::abi_type_to_decode()
+impl From<VoterV1_0> for Voter {
+    fn from(v: VoterV1_0) -> Self {
+        Voter {
+            bless_vote_addr: v.bless_vote_addr,
+            curse_vote_addr: v.curse_vote_addr,
+            curse_unvote_addr: Some(v.curse_unvote_addr),
+            bless_weight: v.bless_weight,
+            curse_weight: v.curse_weight,
+        }
     }
 }
-impl TryFrom<Value> for Voter {
-    type Error = AbiDecodeError;
-    fn try_from(v: Value) -> Result<Self, Self::Error> {
-        let (bless_vote_addr, curse_vote_addr, curse_unvote_addr, bless_weight, curse_weight) =
-            VoterAsTuple::try_from(v)?;
-        Ok(Self {
-            bless_vote_addr,
-            curse_vote_addr,
-            curse_unvote_addr,
-            bless_weight,
-            curse_weight,
-        })
+impl From<VoterV1_5> for Voter {
+    fn from(v: VoterV1_5) -> Self {
+        Voter {
+            bless_vote_addr: v.bless_vote_addr,
+            curse_vote_addr: v.curse_vote_addr,
+            curse_unvote_addr: None,
+            bless_weight: v.bless_weight,
+            curse_weight: v.curse_weight,
+        }
     }
 }
 
@@ -50,24 +58,22 @@ pub struct OnchainConfig {
     pub curse_weight_threshold: u16,
 }
 
-type OnchainConfigAsTuple = (Vec<Voter>, u16, u16);
-
-impl AbiTypeToDecode for OnchainConfig {
-    fn abi_type_to_decode() -> Type {
-        OnchainConfigAsTuple::abi_type_to_decode()
+impl From<OnchainConfigV1_0> for OnchainConfig {
+    fn from(v: OnchainConfigV1_0) -> Self {
+        OnchainConfig {
+            voters: v.voters.into_iter().map(|v| v.into()).collect(),
+            bless_weight_threshold: v.bless_weight_threshold,
+            curse_weight_threshold: v.curse_weight_threshold,
+        }
     }
 }
-
-impl TryFrom<Value> for OnchainConfig {
-    type Error = AbiDecodeError;
-    fn try_from(value: Value) -> std::result::Result<Self, Self::Error> {
-        let (voters, bless_weight_threshold, curse_weight_threshold) =
-            OnchainConfigAsTuple::try_from(value)?;
-        Ok(Self {
-            voters,
-            bless_weight_threshold,
-            curse_weight_threshold,
-        })
+impl From<OnchainConfigV1_5> for OnchainConfig {
+    fn from(v: OnchainConfigV1_5) -> Self {
+        OnchainConfig {
+            voters: v.voters.into_iter().map(|v| v.into()).collect(),
+            bless_weight_threshold: v.bless_weight_threshold,
+            curse_weight_threshold: v.curse_weight_threshold,
+        }
     }
 }
 
@@ -148,6 +154,7 @@ fn parse_indexed_config_version_voter_and_root_as_tuple(
     })?)?;
     Ok((config_version, voter))
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VotedToBlessEvent {
     pub config_version: u32,
@@ -177,6 +184,7 @@ impl UncheckedDecodeLog for VotedToBlessEvent {
         })
     }
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlreadyVotedToBlessEvent {
     pub config_version: u32,
@@ -202,6 +210,7 @@ impl UncheckedDecodeLog for AlreadyVotedToBlessEvent {
         })
     }
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlreadyBlessedEvent {
     pub config_version: u32,
@@ -270,7 +279,7 @@ impl TaggedRoot {
     }
 }
 
-struct VoteToBlessCall {
+pub struct VoteToBlessCall {
     pub tagged_roots: Vec<TaggedRoot>,
 }
 impl ContractCall for VoteToBlessCall {
@@ -282,32 +291,10 @@ impl ContractCall for VoteToBlessCall {
     }
 }
 
-struct VoteToCurseCall {
-    curse_id: Bytes32,
-}
-impl ContractCall for VoteToCurseCall {
-    fn contract_call_signature() -> &'static str {
-        "voteToCurse(bytes32)"
-    }
-    fn contract_call_parameters(self) -> Value {
-        (self.curse_id,).into()
-    }
-}
-
-struct GetConfigDetailsCall;
+pub struct GetConfigDetailsCall;
 impl ContractCall for GetConfigDetailsCall {
     fn contract_call_signature() -> &'static str {
         "getConfigDetails()"
-    }
-    fn contract_call_parameters(self) -> Value {
-        ().into()
-    }
-}
-
-struct IsCursedCall;
-impl ContractCall for IsCursedCall {
-    fn contract_call_signature() -> &'static str {
-        "isCursed()"
     }
     fn contract_call_parameters(self) -> Value {
         ().into()
@@ -321,17 +308,17 @@ pub struct VersionedOnchainConfig {
     pub config: OnchainConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlessProgress {
-    pub bless_vote_addrs: Vec<Address>,
-    pub accumulated_weight: u16,
-    pub blessed: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AFNType {
+    V1_0,
+    V1_5,
 }
 
 #[derive(Clone)]
 pub struct AFNInterface {
     pub address: Address,
-    rpc: Arc<Rpc>,
+    pub rpc: Arc<Rpc>,
+    pub afn_type: AFNType,
 }
 
 impl AFNInterface {
@@ -339,6 +326,7 @@ impl AFNInterface {
         Ok(AFNInterface {
             address: config.afn_contract,
             rpc,
+            afn_type: config.afn_type,
         })
     }
 
@@ -358,37 +346,84 @@ impl AFNInterface {
     }
 
     pub fn get_versioned_onchain_config(&self) -> Result<VersionedOnchainConfig> {
-        let data: Bytes = GetConfigDetailsCall.encode_contract_call();
-        let (version, block_number, config) = {
-            let return_data = self.rpc.call(self.address, data)?;
-            <(u32, u32, OnchainConfig)>::abi_decode(return_data)?
-        };
-        Ok(VersionedOnchainConfig {
-            version,
-            block_number,
-            config,
-        })
+        match self.afn_type {
+            AFNType::V1_0 => {
+                let data: Bytes = GetConfigDetailsCall.encode_contract_call();
+                let (version, block_number, config_v1_0) = {
+                    let return_data = self.rpc.call(self.address, data)?;
+                    <(u32, u32, OnchainConfigV1_0)>::abi_decode(return_data)?
+                };
+                Ok(VersionedOnchainConfig {
+                    version,
+                    block_number,
+                    config: config_v1_0.into(),
+                })
+            }
+            AFNType::V1_5 => {
+                let data: Bytes = GetConfigDetailsCall.encode_contract_call();
+                let (version, block_number, config_v1_5) = {
+                    let return_data = self.rpc.call(self.address, data)?;
+                    <(u32, u32, OnchainConfigV1_5)>::abi_decode(return_data)?
+                };
+                Ok(VersionedOnchainConfig {
+                    version,
+                    block_number,
+                    config: config_v1_5.into(),
+                })
+            }
+        }
     }
 
     pub fn send_vote_to_curse(
         &self,
         tx_sender: &mut TransactionSender,
-        curse_id: Bytes32,
+        curse_id: Bytes16,
+        curse_type: &CurseType,
     ) -> Result<Bytes32> {
-        let data = VoteToCurseCall { curse_id }.encode_contract_call();
-        self.send_transaction(tx_sender, data, 200_000u64)
+        match (self.afn_type, curse_type) {
+            (AFNType::V1_0, CurseType::V1_0) => {
+                let (vote_to_curse_call_v1_0, gas_limit) =
+                    get_vote_to_curse_call_and_gas_limit_v1_0(curse_id);
+                self.send_transaction(
+                    tx_sender,
+                    vote_to_curse_call_v1_0.encode_contract_call(),
+                    gas_limit,
+                )
+            }
+            (AFNType::V1_5, CurseType::V1_5(curse_subjects)) => {
+                let (vote_to_curse_call_v1_5, gas_limit) =
+                    get_vote_to_curse_call_and_gas_limit_v1_5(curse_id, curse_subjects)?;
+                self.send_transaction(
+                    tx_sender,
+                    vote_to_curse_call_v1_5.encode_contract_call(),
+                    gas_limit,
+                )
+            }
+            (AFNType::V1_0, CurseType::V1_5(_)) | (AFNType::V1_5, CurseType::V1_0) => {
+                bail!(
+                    "unsupported curse type {:?} for RMN contract type {:?}",
+                    curse_type,
+                    self.afn_type
+                )
+            }
+        }
     }
-
     pub fn send_vote_to_bless(
         &self,
         tx_sender: &mut TransactionSender,
         votes: Vec<TaggedRoot>,
     ) -> Result<Bytes32> {
-        let gas = 70_000u64 * votes.len() as u64;
-        let data: Bytes = VoteToBlessCall {
-            tagged_roots: votes,
+        match self.afn_type {
+            AFNType::V1_0 | AFNType::V1_5 => {
+                let gas = 70_000u64
+                    .checked_mul(u64::try_from(votes.len())?)
+                    .ok_or(anyhow!("gas limit can't fit into u64"))?;
+                let data: Bytes = VoteToBlessCall {
+                    tagged_roots: votes,
+                }
+                .encode_contract_call();
+                self.send_transaction(tx_sender, data, gas)
+            }
         }
-        .encode_contract_call();
-        self.send_transaction(tx_sender, data, gas)
     }
 }

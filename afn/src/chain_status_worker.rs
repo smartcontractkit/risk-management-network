@@ -2,12 +2,11 @@ use crate::chain_status::{ChainStatus, Tail};
 use crate::common::ChainName;
 use crate::metrics::ChainStatusMetricsHandle;
 use crate::worker::{Context, ShutdownHandle};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use minieth::bytes::Bytes32;
-use minieth::rpc::BlockRpc;
 use minieth::rpc::{Block, BlockIdentifier};
+use minieth::rpc::{BlockRpc, PolkadotBlockRpc};
 use std::collections::{HashMap, VecDeque};
-use std::ops::RangeInclusive;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -22,99 +21,131 @@ pub struct ConfirmationDepthChainStatusUpdater {
     pub soft_confirmations: usize,
     pub hard_confirmations: usize,
     pub rpc: Arc<dyn BlockRpc>,
-    pub name: ChainName,
 }
 
-impl ConfirmationDepthChainStatusUpdater {
-    fn get_block_with_confirmations(&self, confirmations: usize) -> Result<Block> {
-        let latest = self.rpc.get_block(BlockIdentifier::Latest)?;
-        Ok(self.rpc.get_block(BlockIdentifier::Height(
-            latest
-                .number
-                .saturating_sub(u64::try_from(confirmations).unwrap()),
-        ))?)
-    }
-}
+impl GetLatestAndStableBlocks for ConfirmationDepthChainStatusUpdater {
+    fn get_latest_and_stable_blocks(&self) -> Result<LatestAndStableBlocks> {
+        let latest = self
+            .rpc
+            .get_block(BlockIdentifier::Latest)
+            .context("failed to get latest block")?;
+        let soft_confirmed_number = latest
+            .number
+            .checked_sub(self.soft_confirmations as u64)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no soft confirmed block available yet (latest.number={}, soft_confirmations={})",
+                    latest.number,
+                    self.soft_confirmations
+                )
+            })?;
+        let hard_confirmed_number =
+            soft_confirmed_number.checked_sub(self.hard_confirmations as u64)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no hard confirmed block available yet (soft_confirmed.number={}, hard_confirmations={})",
+                    soft_confirmed_number,
+                    self.hard_confirmations
+                )
+            })?;
 
-impl ChainStatusUpdater for ConfirmationDepthChainStatusUpdater {
-    fn initial(&self) -> Result<ChainStatus> {
-        Ok(ChainStatus::Good {
-            tail: Tail::new(vec![self.get_block_with_confirmations(
-                self.hard_confirmations + self.soft_confirmations,
-            )?])?,
+        let [hard_confirmed, soft_confirmed] = get_blocks_that_must_exist(
+            self.rpc.as_ref(),
+            &[
+                BlockIdentifier::Height(hard_confirmed_number),
+                BlockIdentifier::Height(soft_confirmed_number),
+            ],
+        )
+        .context("failed to get hard and soft confirmed blocks")?;
+        Ok(LatestAndStableBlocks {
+            latest: soft_confirmed,
+            stable: hard_confirmed,
         })
     }
 
-    fn update(&self, ctx: &Context, status: &ChainStatus) -> Result<ChainStatus> {
-        match status {
-            ChainStatus::FinalityViolated => Ok(ChainStatus::FinalityViolated),
-            ChainStatus::Good { tail } => {
-                let start = Instant::now();
-
-                let mut new_tail = VecDeque::<Block>::new();
-                new_tail.push_front(self.get_block_with_confirmations(self.soft_confirmations)?);
-                loop {
-                    if ctx.is_done() {
-                        bail!("update aborted due to shutdown signal")
-                    }
-                    let new_tail_head = new_tail.front().unwrap();
-                    if tail.contains(new_tail_head) {
-                        break;
-                    } else if new_tail_head.number == tail.stable_tip().number {
-                        tracing::error!(chain=%self.name, ?tail, ?new_tail, "finality violated: confirmation depth");
-                        return Ok(ChainStatus::FinalityViolated);
-                    } else if new_tail_head.number < tail.stable_tip().number {
-                        warn!(chain=%self.name, ?tail, ?new_tail, "new tail rewound past tail's stable tip; ignoring new tail");
-                        return Ok(ChainStatus::Good { tail: tail.clone() });
-                    }
-                    new_tail.push_front(
-                        self.rpc
-                            .get_block(BlockIdentifier::Hash(new_tail_head.parent_hash))?,
-                    );
-                }
-
-                while new_tail.len() < self.hard_confirmations + 1 {
-                    match new_tail
-                        .front()
-                        .unwrap()
-                        .number
-                        .checked_sub(1)
-                        .and_then(|predecessor_number| tail.block_by_number(predecessor_number))
-                    {
-                        Some(predecessor) => new_tail.push_front(*predecessor),
-                        None => break,
-                    }
-                }
-
-                while new_tail.len() > self.hard_confirmations + 1 {
-                    new_tail.pop_front();
-                }
-
-                trace!(elapsed = ?start.elapsed(), "update took");
-
-                Ok(ChainStatus::Good {
-                    tail: Tail::new(new_tail.into())?,
-                })
-            }
-        }
+    fn get_block_rpc(&self) -> &dyn BlockRpc {
+        self.rpc.as_ref()
     }
 }
 
 pub struct FinalityTagChainStatusUpdater {
-    pub name: ChainName,
     pub rpc: Arc<dyn BlockRpc>,
 }
 
-fn block_cache(rpc: &dyn BlockRpc, range: RangeInclusive<u64>) -> Result<HashMap<Bytes32, Block>> {
-    if range.is_empty() {
-        return Ok(Default::default());
-    }
-    let blks = rpc.get_blocks(&range.map(BlockIdentifier::Height).collect::<Vec<_>>())?;
-    Ok(blks
-        .into_iter()
-        .flat_map(|blk| blk.map(|blk| (blk.hash, blk)))
-        .collect())
+pub struct PolkadotGetFinalizedHeadChainStatusUpdater {
+    pub rpc: Arc<dyn BlockRpc>,
+    pub polkadot_rpc: Arc<dyn PolkadotBlockRpc>,
 }
+
+fn get_block_and_populate_cache_if_needed(
+    cache: &mut HashMap<Bytes32, Block>,
+    rpc: &dyn BlockRpc,
+    min_block_number: u64,
+    (block_number, block_hash): (u64, Bytes32),
+) -> Result<Block> {
+    if let Some(&blk) = cache.get(&block_hash) {
+        return Ok(blk);
+    }
+
+    trace!(block_number, %block_hash, "cache miss");
+
+    let mut blocks_to_request = vec![BlockIdentifier::Hash(block_hash)];
+
+    let min_block_number_to_cache = std::cmp::max(
+        min_block_number,
+        block_number.saturating_sub(BATCH_FETCH_BLOCKS_LIMIT.saturating_sub(1)),
+    );
+    for block_number in min_block_number_to_cache..block_number {
+        blocks_to_request.push(BlockIdentifier::Height(block_number));
+    }
+
+    ensure!(
+        blocks_to_request.len() <= BATCH_FETCH_BLOCKS_LIMIT as usize,
+        "assumption violation: too many blocks to request: {} > {}",
+        blocks_to_request.len(),
+        BATCH_FETCH_BLOCKS_LIMIT
+    );
+
+    let rpc_blocks = match rpc.get_blocks(&blocks_to_request) {
+        Ok(batch_of_blocks) => batch_of_blocks,
+        Err(err) => {
+            warn!(
+                ?err,
+                "failed to get batch of blocks, resorting to sequential block fetching! \
+                usually due to misconfigured rpc settings: batch-response-max-size, batch-request-limit"
+            );
+            vec![rpc.get_block(BlockIdentifier::Hash(block_hash))]
+        }
+    };
+
+    let mut rpc_blocks = VecDeque::from(rpc_blocks);
+
+    let first_rpc_block = rpc_blocks
+        .pop_front()
+        .context("assumption violation: not all batch calls were responded to, though outer result was Ok")?
+        .with_context(|| format!("expected block with hash {}", block_hash))?;
+
+    ensure!(
+        (first_rpc_block.hash, first_rpc_block.number) == (block_hash, block_number),
+        "expected block with number {} and hash {}, got block {:?}",
+        block_number,
+        block_hash,
+        first_rpc_block
+    );
+
+    cache.clear();
+    cache.extend::<HashMap<Bytes32, Block>>(
+        rpc_blocks
+            .drain(..)
+            .flatten()
+            .map(|block| (block.hash, block))
+            .collect(),
+    );
+
+    Ok(first_rpc_block)
+}
+
+const BATCH_FETCH_BLOCKS_LIMIT: u64 = 100 - 1;
 
 fn get_blocks_that_must_exist<const N: usize>(
     rpc: &dyn BlockRpc,
@@ -132,10 +163,73 @@ fn get_blocks_that_must_exist<const N: usize>(
         })
 }
 
-impl ChainStatusUpdater for FinalityTagChainStatusUpdater {
+struct LatestAndStableBlocks {
+    latest: Block,
+    stable: Block,
+}
+
+trait GetLatestAndStableBlocks {
+    fn get_latest_and_stable_blocks(&self) -> Result<LatestAndStableBlocks>;
+    fn get_block_rpc(&self) -> &dyn BlockRpc;
+}
+
+impl GetLatestAndStableBlocks for FinalityTagChainStatusUpdater {
+    fn get_latest_and_stable_blocks(&self) -> Result<LatestAndStableBlocks> {
+        let [finalized, latest] = get_blocks_that_must_exist(
+            self.rpc.as_ref(),
+            &[BlockIdentifier::Finalized, BlockIdentifier::Latest],
+        )
+        .context("failed to get finalized and latest blocks")?;
+        Ok(LatestAndStableBlocks {
+            latest,
+            stable: finalized,
+        })
+    }
+
+    fn get_block_rpc(&self) -> &dyn BlockRpc {
+        self.rpc.as_ref()
+    }
+}
+
+impl GetLatestAndStableBlocks for PolkadotGetFinalizedHeadChainStatusUpdater {
+    fn get_latest_and_stable_blocks(&self) -> Result<LatestAndStableBlocks> {
+        let polkadot_finalized_number = {
+            let polkadot_finalized_head_hash = self
+                .polkadot_rpc
+                .polkadot_get_finalized_head()
+                .context("failed to get Polkadot finalized head hash via chain_getFinalizedHead")?;
+            let polkadot_block = self
+                .polkadot_rpc
+                .polkadot_get_block(polkadot_finalized_head_hash)
+                .context("failed to get Polkadot signed block via chain_getBlock")?;
+            polkadot_block.header.number
+        };
+
+        let [finalized, latest] = get_blocks_that_must_exist(
+            self.rpc.as_ref(),
+            &[
+                BlockIdentifier::Height(polkadot_finalized_number),
+                BlockIdentifier::Latest,
+            ],
+        )
+        .context("failed to get Polkadot finalized and latest blocks")?;
+
+        Ok(LatestAndStableBlocks {
+            latest,
+            stable: finalized,
+        })
+    }
+
+    fn get_block_rpc(&self) -> &dyn BlockRpc {
+        self.rpc.as_ref()
+    }
+}
+
+impl<T: GetLatestAndStableBlocks> ChainStatusUpdater for T {
     fn initial(&self) -> Result<ChainStatus> {
+        let LatestAndStableBlocks { stable, .. } = self.get_latest_and_stable_blocks()?;
         Ok(ChainStatus::Good {
-            tail: Tail::new(vec![self.rpc.get_block(BlockIdentifier::Finalized)?])?,
+            tail: Tail::new(vec![stable])?,
         })
     }
 
@@ -144,33 +238,21 @@ impl ChainStatusUpdater for FinalityTagChainStatusUpdater {
             ChainStatus::FinalityViolated => Ok(ChainStatus::FinalityViolated),
             ChainStatus::Good { tail } => {
                 let start = Instant::now();
-                let (finalized, latest) = {
-                    let [rpc_finalized, rpc_latest] = get_blocks_that_must_exist(
-                        self.rpc.as_ref(),
-                        &[BlockIdentifier::Finalized, BlockIdentifier::Latest],
-                    )?;
-                    if rpc_finalized.number <= rpc_latest.number {
-                        (rpc_finalized, rpc_latest)
-                    } else {
-                        tracing::warn!(
-                            chain=%self.name,
-                            ?tail,
-                            ?rpc_finalized,
-                            ?rpc_latest,
-                            "received finalized block with higher block number than latest block, ignoring latest block"
-                        );
-                        (rpc_finalized, rpc_finalized)
-                    }
-                };
-                let cache = match block_cache(self.rpc.as_ref(), tail.tip().number..=latest.number)
-                {
-                    Ok(cache) => cache,
-                    Err(err) => {
-                        warn!(chain=%self.name, %err, "failed to build block cache; do you need to adjust your batching limits?");
-                        Default::default()
-                    }
-                };
+                let LatestAndStableBlocks { mut latest, stable } =
+                    self.get_latest_and_stable_blocks()?;
+                if stable.number > latest.number {
+                    warn!(
+                        ?stable,
+                        ?latest,
+                        "received stable block with higher block number than latest block, ignoring latest block"
+                    );
+                    latest = stable;
+                }
+
                 let mut new_tail = VecDeque::from([latest]);
+
+                let mut cache: HashMap<Bytes32, Block> = HashMap::new();
+
                 loop {
                     if ctx.is_done() {
                         bail!("update aborted due to shutdown signal")
@@ -179,31 +261,67 @@ impl ChainStatusUpdater for FinalityTagChainStatusUpdater {
                     if tail.contains(new_tail_head) {
                         break;
                     } else if new_tail_head.number == tail.stable_tip().number {
-                        tracing::error!(chain=%self.name, ?tail, ?new_tail, "finality violated: finality tag");
+                        tracing::error!(
+                            ?tail,
+                            ?new_tail,
+                            "finality violated: latest block leads to block at the same number but with different hash \
+                            from the prior stable tip"
+                        );
                         return Ok(ChainStatus::FinalityViolated);
-                    } else if new_tail_head.number == finalized.number
-                        && new_tail_head.hash != finalized.hash
+                    } else if new_tail_head.number == stable.number
+                        && new_tail_head.hash != stable.hash
                     {
-                        tracing::error!(chain=%self.name, ?tail, ?new_tail, ?finalized, "finality violated: conflicting finalized blocks");
+                        tracing::error!(
+                            ?tail,
+                            ?new_tail,
+                            ?stable,
+                            "finality violated: latest block leads to block at the same number but with different hash \
+                            from the stable block queried at the beginning of the update"
+                        );
                         return Ok(ChainStatus::FinalityViolated);
                     } else if new_tail_head.number < tail.stable_tip().number {
-                        warn!(chain=%self.name, ?tail, ?new_tail, "new tail rewound past tail's stable tip; ignoring new tail");
+                        warn!(
+                            ?tail,
+                            ?new_tail,
+                            "new tail rewound past tail's stable tip; ignoring new tail"
+                        );
                         return Ok(ChainStatus::Good { tail: tail.clone() });
                     }
 
-                    match cache.get(&new_tail_head.parent_hash) {
-                        Some(&blk) => new_tail.push_front(blk),
-                        None => {
-                            trace!("cache miss for {}", new_tail_head.parent_hash);
-                            new_tail.push_front(
-                                self.rpc
-                                    .get_block(BlockIdentifier::Hash(new_tail_head.parent_hash))?,
-                            );
+                    let (parent_block_number, parent_block_hash) = (
+                        new_tail_head
+                            .number
+                            .checked_sub(1)
+                            .context("cannot go beyond genesis block")?,
+                        new_tail_head.parent_hash,
+                    );
+                    let parent_block = match tail.block_by_number(parent_block_number) {
+                        Some(tails_block)
+                            if (tails_block.number, tails_block.hash)
+                                == (parent_block_number, parent_block_hash) =>
+                        {
+                            *tails_block
+                        }
+                        _ => {
+                            let min_block_number_to_populate_cache_with =
+                                if parent_block_number > tail.tip().number {
+                                    tail.tip().number
+                                } else {
+                                    tail.stable_tip().number
+                                };
+
+                            get_block_and_populate_cache_if_needed(
+                                &mut cache,
+                                self.get_block_rpc(),
+                                min_block_number_to_populate_cache_with,
+                                (parent_block_number, parent_block_hash),
+                            )?
                         }
                     };
+                    new_tail.push_front(parent_block);
                 }
 
-                while new_tail.front().unwrap().number > finalized.number {
+                while new_tail.front().unwrap().number > stable.number {
                     match new_tail
                         .front()
                         .unwrap()
@@ -216,16 +334,15 @@ impl ChainStatusUpdater for FinalityTagChainStatusUpdater {
                     }
                 }
 
-                while new_tail.front().unwrap().number < finalized.number {
+                while new_tail.front().unwrap().number < stable.number {
                     new_tail.pop_front();
                 }
 
                 let new_tail = Tail::new(new_tail.into())?;
                 trace!(
                     elapsed = ?start.elapsed(),
-                    "updated tail {} for chain {} with size {}",
+                    "updated tail {} with size {}",
                     new_tail,
-                    self.name,
                     new_tail.tip().number-new_tail.stable_tip().number+1,
                 );
                 Ok(ChainStatus::Good { tail: new_tail })
@@ -262,11 +379,20 @@ impl ChainStatusWorker {
                         chain_status_metrics_handle
                             .latest_block_number
                             .set(latest_block.number as f64);
+
+                        chain_status_metrics_handle
+                            .latest_block_timestamp
+                            .set(latest_block.timestamp as f64)
                     }
+
                     if let Some(finalized_block) = chain_status.stable_tip() {
                         chain_status_metrics_handle
                             .finalized_block_number
                             .set(finalized_block.number as f64);
+
+                        chain_status_metrics_handle
+                            .finalized_block_timestamp
+                            .set(finalized_block.timestamp as f64);
                     }
 
                     chain_status_metrics_handle.finality_violated.set(
@@ -277,6 +403,9 @@ impl ChainStatusWorker {
                         },
                     );
                 };
+
+                let span = tracing::error_span!("chain status", chain=%chain_name);
+                let _enter = span.enter();
 
                 ctx.repeat(worker_name.clone(), poll_interval, move |ctx| {
                     let new_chain_status = match latest_chain_status.read().unwrap().as_ref() {
@@ -298,8 +427,14 @@ impl ChainStatusWorker {
             handle,
         )
     }
+}
 
-    pub fn latest_chain_status(&self) -> Option<ChainStatus> {
+impl ChainStatusProvider for ChainStatusWorker {
+    fn latest_chain_status(&self) -> Option<ChainStatus> {
         self.latest_chain_status.read().unwrap().to_owned()
     }
+}
+
+pub trait ChainStatusProvider: Sync + Send {
+    fn latest_chain_status(&self) -> Option<ChainStatus>;
 }

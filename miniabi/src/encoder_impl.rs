@@ -1,6 +1,6 @@
 use crate::types::Value;
 use minieth::{
-    bytes::{Address, Bytes, Bytes32},
+    bytes::{Address, Bytes, Bytes16, Bytes32},
     u256::U256,
 };
 
@@ -24,11 +24,6 @@ fn pad_right_to_multiple_of_32_bytes(v: &[u8]) -> Vec<u8> {
 
 trait ActualDataEncode: Sized {
     fn encode_actual_data_into(self, bytes: &mut Vec<u8>);
-    fn encode_actual_data(self) -> Bytes {
-        let mut bytes = Vec::new();
-        self.encode_actual_data_into(&mut bytes);
-        bytes.into()
-    }
 }
 
 impl ActualDataEncode for U256 {
@@ -59,10 +54,19 @@ impl ActualDataEncode for Address {
         bytes.extend(self.as_slice());
     }
 }
+
 impl ActualDataEncode for Bytes32 {
     fn encode_actual_data_into(self, bytes: &mut Vec<u8>) {
         let data = <[u8; 32]>::from(self);
         bytes.extend(&data)
+    }
+}
+
+impl ActualDataEncode for Bytes16 {
+    fn encode_actual_data_into(self, bytes: &mut Vec<u8>) {
+        let data = <[u8; 16]>::from(self);
+        bytes.extend(&data);
+        bytes.extend(&[0; 16]);
     }
 }
 
@@ -137,6 +141,7 @@ impl ActualDataEncode for Value {
             Value::U32(v) => v.encode_actual_data_into(bytes),
             Value::U16(v) => v.encode_actual_data_into(bytes),
             Value::U8(v) => v.encode_actual_data_into(bytes),
+            Value::Bytes16(v) => v.encode_actual_data_into(bytes),
             Value::Address(v) => v.encode_actual_data_into(bytes),
             Value::Bytes32(v) => v.encode_actual_data_into(bytes),
             Value::Bytes(v) => v.encode_actual_data_into(bytes),

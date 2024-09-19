@@ -1,11 +1,10 @@
 use crate::{
     cached_rpc::CachedRpc,
     chain_status::{age, ChainStatus},
-    chain_status_worker::ChainStatusWorker,
+    chain_status_worker::ChainStatusProvider,
     common::{ChainName, DecodeLog, LogTopic},
     config::{ChainStability, LaneType},
-    evm2evm_onramp_v1_0::CcipSendRequestedEventV1_0,
-    evm2evm_onramp_v1_2::CcipSendRequestedEventV1_2,
+    evm2evm_onramp::CcipSendRequestedEvent,
     onramp_traits::OnRampReader,
     worker::{self, ShutdownHandle},
 };
@@ -13,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bit_set::BitSet;
 use minieth::{
     bytes::{Address, Bytes32},
-    rpc::{EVMLog, Rpc},
+    rpc::{EVMLog, LogsRpc},
 };
 use std::{
     sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -222,6 +221,11 @@ impl<S: State> ContractEventStateMachine<S> {
         };
         (self.state_read(), is_synced)
     }
+
+    pub fn initially_synced_state_read(&self) -> (RwLockReadGuard<S>, bool) {
+        let is_initially_synced = self.timestamp.lock().unwrap().is_some();
+        (self.state_read(), is_initially_synced)
+    }
 }
 
 pub struct UnstableContractEventStateMachineWorker<S: State> {
@@ -263,8 +267,8 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
         poll_interval: std::time::Duration,
         cesm: ContractEventStateMachine<S>,
         chain: ChainName,
-        rpc: Arc<Rpc>,
-        chain_status_worker: std::sync::Arc<ChainStatusWorker>,
+        rpc: Arc<dyn LogsRpc>,
+        chain_status_worker: Arc<dyn ChainStatusProvider>,
         chain_stability: ChainStability,
     ) -> (Self, ShutdownHandle) {
         let log_topics = cesm.contract_event_filter.log_topics();
@@ -352,6 +356,10 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
         self.unstable_cesm.state_read()
     }
 
+    pub fn initially_synced_unstable_state_read(&self) -> (RwLockReadGuard<S>, bool) {
+        self.unstable_cesm.initially_synced_state_read()
+    }
+
     pub fn unstable_and_stable_state_read(&self) -> (RwLockReadGuard<S>, RwLockReadGuard<S>) {
         (
             self.unstable_cesm.state_read(),
@@ -371,8 +379,7 @@ impl<S: State + Send + Sync + 'static> UnstableContractEventStateMachineWorker<S
 
 #[derive(Debug, Clone)]
 pub enum CcipSendRequestedEventUnion {
-    Evm2EvmV1_0(CcipSendRequestedEventV1_0),
-    Evm2EvmV1_2(CcipSendRequestedEventV1_2),
+    CcipSendRequestedEvent(CcipSendRequestedEvent),
 }
 
 #[derive(Clone)]
@@ -383,31 +390,26 @@ pub struct VersionedCcipSendRequestFilter {
 impl ContractEventFilter for VersionedCcipSendRequestFilter {
     type ContractEventUnion = CcipSendRequestedEventUnion;
     fn log_topics(&self) -> Vec<Bytes32> {
-        match self.lane_type {
-            LaneType::Evm2EvmV1_0 => {
-                vec![CcipSendRequestedEventV1_0::log_topic()]
+        let non_versioned_topics = vec![CcipSendRequestedEvent::log_topic()];
+        let versioned_topics = match self.lane_type {
+            LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5 => {
+                vec![]
             }
-            LaneType::Evm2EvmV1_2 => {
-                vec![CcipSendRequestedEventV1_2::log_topic()]
-            }
-        }
+        };
+        [non_versioned_topics, versioned_topics].concat()
     }
     fn decode_log(&self, log: EVMLog) -> Result<Self::ContractEventUnion> {
         let &topic = log
             .topics
             .first()
             .ok_or(anyhow!("cannot decode log with empty topic"))?;
-        if matches!(self.lane_type, LaneType::Evm2EvmV1_0)
-            && topic == CcipSendRequestedEventV1_0::log_topic()
+        if matches!(
+            self.lane_type,
+            LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5
+        ) && topic == CcipSendRequestedEvent::log_topic()
         {
-            Ok(CcipSendRequestedEventUnion::Evm2EvmV1_0(
-                CcipSendRequestedEventV1_0::decode_log(log)?,
-            ))
-        } else if matches!(self.lane_type, LaneType::Evm2EvmV1_2)
-            && topic == CcipSendRequestedEventV1_2::log_topic()
-        {
-            Ok(CcipSendRequestedEventUnion::Evm2EvmV1_2(
-                CcipSendRequestedEventV1_2::decode_log(log)?,
+            Ok(CcipSendRequestedEventUnion::CcipSendRequestedEvent(
+                CcipSendRequestedEvent::decode_log(log)?,
             ))
         } else {
             Err(anyhow!(
@@ -438,7 +440,10 @@ impl State for SourceBlessState {
     ) -> Result<()> {
         use crate::hashable::Hashable;
         let (seq_nr, msg_hash, msg_id) = match (filter.lane_type, ev) {
-            (LaneType::Evm2EvmV1_0, CcipSendRequestedEventUnion::Evm2EvmV1_0(ev)) => {
+            (
+                LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5,
+                CcipSendRequestedEventUnion::CcipSendRequestedEvent(ev),
+            ) => {
                 let msg = ev.message;
                 (
                     msg.sequence_number,
@@ -446,17 +451,9 @@ impl State for SourceBlessState {
                     msg.message_id,
                 )
             }
-            (LaneType::Evm2EvmV1_2, CcipSendRequestedEventUnion::Evm2EvmV1_2(ev)) => {
-                let msg = ev.message;
-                (
-                    msg.sequence_number,
-                    msg.hash(&self.message_metadata),
-                    msg.message_id,
-                )
-            }
-            (ty @ LaneType::Evm2EvmV1_0, ev @ CcipSendRequestedEventUnion::Evm2EvmV1_2(_))
-            | (ty @ LaneType::Evm2EvmV1_2, ev @ CcipSendRequestedEventUnion::Evm2EvmV1_0(_)) => {
-                bail!("lane type mismatch: expected message of type {ty:?} but got {ev:?}",);
+            #[allow(unreachable_patterns)]
+            (type_, ev) => {
+                bail!("unexpected lane type {type_:?} and event {ev:?}",);
             }
         };
         if msg_hash != msg_id {
@@ -479,10 +476,7 @@ impl State for SourceBlessState {
 }
 
 impl OnRampReader for SourceBlessState {
-    fn get_message_hashes(
-        &self,
-        interval: &crate::commit_store_common::Interval,
-    ) -> Option<Vec<Bytes32>> {
+    fn get_message_hashes(&self, interval: &crate::commit_store::Interval) -> Option<Vec<Bytes32>> {
         let &(initial_seq_nr, _) = self.seq_nrs_and_message_hashes.front()?;
 
         let start_index = (interval.min as usize).checked_sub(initial_seq_nr as usize)?;
@@ -527,8 +521,7 @@ pub enum DestEventUnion {
     AlreadyBlessed(crate::afn_contract::AlreadyBlessedEvent),
     Voted(crate::afn_contract::VotedToBlessEvent),
     AlreadyVoted(crate::afn_contract::AlreadyVotedToBlessEvent),
-    CommittedV1_0(crate::commit_store_v1_0::ReportAcceptedEventV1_0),
-    CommittedV1_2(crate::commit_store_v1_2::ReportAcceptedEventV1_2),
+    Committed(crate::commit_store::ReportAcceptedEvent),
 }
 #[derive(Clone)]
 pub struct VersionedDestEventFilter {
@@ -544,13 +537,11 @@ impl ContractEventFilter for VersionedDestEventFilter {
             crate::afn_contract::AlreadyBlessedEvent::log_topic(),
             crate::afn_contract::VotedToBlessEvent::log_topic(),
             crate::afn_contract::AlreadyVotedToBlessEvent::log_topic(),
+            crate::commit_store::ReportAcceptedEvent::log_topic(),
         ];
         let versioned_topics = match self.lane_type {
-            LaneType::Evm2EvmV1_0 => {
-                vec![crate::commit_store_v1_0::ReportAcceptedEventV1_0::log_topic()]
-            }
-            LaneType::Evm2EvmV1_2 => {
-                vec![crate::commit_store_v1_2::ReportAcceptedEventV1_2::log_topic()]
+            LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5 => {
+                vec![]
             }
         };
         [non_versioned_topics, versioned_topics].concat()
@@ -581,17 +572,9 @@ impl ContractEventFilter for VersionedDestEventFilter {
             Ok(DestEventUnion::AlreadyVoted(
                 crate::afn_contract::AlreadyVotedToBlessEvent::decode_log(log)?,
             ))
-        } else if topic == crate::commit_store_v1_0::ReportAcceptedEventV1_0::log_topic()
-            && matches!(self.lane_type, LaneType::Evm2EvmV1_0)
-        {
-            Ok(DestEventUnion::CommittedV1_0(
-                crate::commit_store_v1_0::ReportAcceptedEventV1_0::decode_log(log)?,
-            ))
-        } else if topic == crate::commit_store_v1_2::ReportAcceptedEventV1_2::log_topic()
-            && matches!(self.lane_type, LaneType::Evm2EvmV1_2)
-        {
-            Ok(DestEventUnion::CommittedV1_2(
-                crate::commit_store_v1_2::ReportAcceptedEventV1_2::decode_log(log)?,
+        } else if topic == crate::commit_store::ReportAcceptedEvent::log_topic() {
+            Ok(DestEventUnion::Committed(
+                crate::commit_store::ReportAcceptedEvent::decode_log(log)?,
             ))
         } else {
             Err(anyhow!(
@@ -612,7 +595,7 @@ pub struct DestBlessState {
 
     pub my_voted_but_not_yet_blessed_roots: std::collections::HashSet<Bytes32>,
     pub blessed_roots: std::collections::HashSet<Bytes32>,
-    pub committed_roots_with_intervals: std::vec::Vec<crate::commit_store_common::RootWithInterval>,
+    pub committed_roots_with_intervals: std::vec::Vec<crate::commit_store::RootWithInterval>,
 }
 
 impl State for DestBlessState {
@@ -630,11 +613,10 @@ impl State for DestBlessState {
             AlreadyBlessedEvent, AlreadyVotedToBlessEvent, TaggedRootBlessVotesResetEvent,
             TaggedRootBlessedEvent, VotedToBlessEvent,
         };
-        use crate::commit_store_v1_0::ReportAcceptedEventV1_0;
-        use crate::commit_store_v1_2::ReportAcceptedEventV1_2;
+        use crate::commit_store::ReportAcceptedEvent;
         match (filter.lane_type, ev) {
             (
-                LaneType::Evm2EvmV1_0 | LaneType::Evm2EvmV1_2,
+                LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5,
                 DestEventUnion::Blessed(TaggedRootBlessedEvent { tagged_root, .. })
                 | DestEventUnion::AlreadyBlessed(AlreadyBlessedEvent { tagged_root, .. }),
             ) => {
@@ -645,7 +627,7 @@ impl State for DestBlessState {
                 }
             }
             (
-                LaneType::Evm2EvmV1_0 | LaneType::Evm2EvmV1_2,
+                LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5,
                 DestEventUnion::Voted(VotedToBlessEvent {
                     config_version,
                     voter,
@@ -654,7 +636,7 @@ impl State for DestBlessState {
                 }),
             )
             | (
-                LaneType::Evm2EvmV1_0 | LaneType::Evm2EvmV1_2,
+                LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5,
                 DestEventUnion::AlreadyVoted(AlreadyVotedToBlessEvent {
                     config_version,
                     voter,
@@ -673,7 +655,7 @@ impl State for DestBlessState {
                 }
             }
             (
-                LaneType::Evm2EvmV1_0 | LaneType::Evm2EvmV1_2,
+                LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5,
                 DestEventUnion::BlessVotesReset(TaggedRootBlessVotesResetEvent {
                     config_version,
                     tagged_root,
@@ -689,20 +671,14 @@ impl State for DestBlessState {
                 }
             }
             (
-                LaneType::Evm2EvmV1_0,
-                DestEventUnion::CommittedV1_0(ReportAcceptedEventV1_0 { report }),
+                LaneType::Evm2EvmV1_2 | LaneType::Evm2EvmV1_5,
+                DestEventUnion::Committed(ReportAcceptedEvent { report }),
             ) => {
                 self.committed_roots_with_intervals.push(report.into());
             }
-            (
-                LaneType::Evm2EvmV1_2,
-                DestEventUnion::CommittedV1_2(ReportAcceptedEventV1_2 { report }),
-            ) => {
-                self.committed_roots_with_intervals.push(report.into());
-            }
-            (ty @ LaneType::Evm2EvmV1_2, ev @ DestEventUnion::CommittedV1_0(_))
-            | (ty @ LaneType::Evm2EvmV1_0, ev @ DestEventUnion::CommittedV1_2(_)) => {
-                bail!("lane type mismatch: expected message of type {ty:?} but got {ev:?}",);
+            #[allow(unreachable_patterns)]
+            (type_, ev) => {
+                bail!("unexpected lane type {type_:?} and event {ev:?}",);
             }
         };
         Ok(())
@@ -712,7 +688,7 @@ impl State for DestBlessState {
 impl DestBlessState {
     pub fn unverified_roots_with_intervals_we_could_vote(
         &self,
-    ) -> impl Iterator<Item = (usize, &crate::commit_store_common::RootWithInterval)> + '_ {
+    ) -> impl Iterator<Item = (usize, &crate::commit_store::RootWithInterval)> + '_ {
         self.committed_roots_with_intervals
             .iter()
             .enumerate()

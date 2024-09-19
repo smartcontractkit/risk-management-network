@@ -90,18 +90,10 @@ impl LaneState {
                 },
             ),
             dest_chain_config.name,
-            Arc::clone(&dest_rpc),
-            Arc::clone(&dest_chain_status_worker),
+            Arc::clone(&dest_rpc) as _,
+            Arc::clone(&dest_chain_status_worker) as _,
             dest_chain_config.stability,
         )));
-        let lane_bless_status_worker =
-            Arc::new(shutdown_handles.add(LaneBlessStatusWorker::spawn(
-                ctx,
-                lane_id.clone(),
-                Arc::clone(&source_bless_worker),
-                Arc::clone(&dest_bless_worker),
-                crate::config::LANE_BLESS_STATUS_POLL_INTERVAL,
-            )?));
         let dest_offramp_worker = Arc::new(shutdown_handles.add(DestOffRampWorker::spawn(
             ctx,
             &format!("DestOffRampWorker({})", lane_id),
@@ -114,10 +106,19 @@ impl LaneState {
                 SimpleExecutionStateChangedFilter,
             ),
             dest_chain_config.name,
-            Arc::clone(&dest_rpc),
-            Arc::clone(&dest_chain_status_worker),
+            Arc::clone(&dest_rpc) as _,
+            Arc::clone(&dest_chain_status_worker) as _,
             dest_chain_config.stability,
         )));
+        let lane_bless_status_worker =
+            Arc::new(shutdown_handles.add(LaneBlessStatusWorker::spawn(
+                ctx,
+                lane_id.clone(),
+                Arc::clone(&source_bless_worker),
+                Arc::clone(&dest_bless_worker),
+                Arc::clone(&dest_offramp_worker),
+                crate::config::LANE_BLESS_STATUS_POLL_INTERVAL,
+            )?));
 
         let offramp_anomaly_detector =
             Arc::new(shutdown_handles.add(OffRampAnomalyDetector::spawn(

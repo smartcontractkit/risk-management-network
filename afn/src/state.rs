@@ -6,21 +6,22 @@ use super::{
 use crate::{
     chain_selector::chain_selector,
     chain_state::ChainState,
+    chain_status_worker::ChainStatusProvider,
     common::{ChainName, LaneId},
-    config::{OffchainConfig, SharedLaneConfig},
+    config::{OffchainConfig, SharedChainConfig, SharedLaneConfig},
     config_sanity_check::{
         onchain_commit_store_static_config, onchain_offramp_static_config,
         onchain_onramp_static_config, onchain_type_and_version, CommitStoreStaticConfig,
         OffRampStaticConfig, OnRampStaticConfig,
     },
-    curse_beacon::{CursableAnomaliesWithCurseIds, CursableAnomaly, CurseBeacon, CurseId},
+    curse_beacon::{BaseCurseId, CursableAnomaliesWithVotableCurses, CursableAnomaly, CurseBeacon},
     key_types::BlessCurseKeysByChain,
     metrics::{LaneStatusMetricsHandle, MetricTypeGaugeHandle, Metrics, MetricsFileWorker},
     reaper::{spawn_reaper, ReapableLaneWorkers},
     worker::{self, ShutdownHandleGroup},
 };
 use anyhow::{anyhow, bail, Context, Result};
-use minieth::rpc::Rpc;
+use minieth::rpc::{LogsRpc, Rpc};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -257,7 +258,7 @@ fn validate_onchain_lane_config(
     std::thread::scope(|s| {
         let handles = vec![
         s.spawn(move || {
-            let onchain_onramp_config = onchain_onramp_static_config(&rpcs[&src_chain], on_ramp)?;
+            let onchain_onramp_config = onchain_onramp_static_config(&rpcs[&src_chain], on_ramp, lane_type)?;
             let expected_onchain_onramp_config = OnRampStaticConfig {
                 chain_selector: src_chain_selector,
                 dest_chain_selector,
@@ -270,7 +271,8 @@ fn validate_onchain_lane_config(
         s.spawn(move || {
             let onchain_onramp_type_and_version = onchain_type_and_version(&rpcs[&src_chain], on_ramp)?;
             match (&onchain_onramp_type_and_version as &str, lane_type) {
-                ("EVM2EVMOnRamp 1.0.0" | "EVM2EVMOnRamp 1.1.0", Evm2EvmV1_0) | ("EVM2EVMOnRamp 1.2.0", Evm2EvmV1_2) => Ok(()),
+                ("EVM2EVMOnRamp 1.2.0", Evm2EvmV1_2) => Ok(()),
+                ("EVM2EVMOnRamp 1.5.0", Evm2EvmV1_5)|("EVM2EVMOnRamp 1.5.0-dev", Evm2EvmV1_5) => Ok(()),
                 _ => {
                     bail!("unexpected onchain onramp type and version {onchain_onramp_type_and_version:?} for lane type {lane_type:?}");
                 }
@@ -278,7 +280,7 @@ fn validate_onchain_lane_config(
         }),
         s.spawn(move ||{
             let onchain_offramp_config =
-                onchain_offramp_static_config(&rpcs[&dest_chain], off_ramp)?;
+                onchain_offramp_static_config(&rpcs[&dest_chain], off_ramp, lane_type)?;
             let expected_onchain_offramp_config = OffRampStaticConfig {
                 chain_selector: dest_chain_selector,
                 src_chain_selector,
@@ -293,7 +295,8 @@ fn validate_onchain_lane_config(
         s.spawn(move || {
             let onchain_offramp_type_and_version = onchain_type_and_version(&rpcs[&dest_chain], off_ramp)?;
             match (&onchain_offramp_type_and_version as &str, lane_type) {
-                ("EVM2EVMOffRamp 1.0.0" | "EVM2EVMOffRamp 1.1.0", Evm2EvmV1_0) | ("EVM2EVMOffRamp 1.2.0", Evm2EvmV1_2) => Ok(()),
+                ("EVM2EVMOffRamp 1.2.0", Evm2EvmV1_2) => Ok(()),
+                ("EVM2EVMOffRamp 1.5.0", Evm2EvmV1_5)|("EVM2EVMOffRamp 1.5.0-dev", Evm2EvmV1_5) => Ok(()),
                 _ => {
                     bail!("unexpected onchain offramp type and version {onchain_offramp_type_and_version:?} for lane type {lane_type:?}");
                 }
@@ -315,7 +318,8 @@ fn validate_onchain_lane_config(
         s.spawn(move || {
             let onchain_commit_store_type_and_version = onchain_type_and_version(&rpcs[&dest_chain], commit_store)?;
             match (&onchain_commit_store_type_and_version as &str, lane_type) {
-                ("CommitStore 1.0.0" | "CommitStore 1.1.0", Evm2EvmV1_0) | ("CommitStore 1.2.0", Evm2EvmV1_2) => Ok(()),
+                ("CommitStore 1.2.0", Evm2EvmV1_2) => Ok(()),
+                ("CommitStore 1.5.0", Evm2EvmV1_5)|("CommitStore 1.5.0-dev", Evm2EvmV1_5) => Ok(()),
                 _ => {
                     bail!("unexpected onchain commit store type and version {onchain_commit_store_type_and_version:?} for lane type {lane_type:?}");
                 }
@@ -328,13 +332,43 @@ fn validate_onchain_lane_config(
     })
 }
 
+fn validate_onchain_chain_config(
+    chain_config: &SharedChainConfig,
+    rpcs: &HashMap<ChainName, Arc<Rpc>>,
+) -> anyhow::Result<()> {
+    let SharedChainConfig {
+        name,
+        afn_contract,
+        afn_type,
+        ..
+    } = *chain_config;
+    std::thread::scope(|s| {
+        let handles = vec![s.spawn(move || {
+            let onchain_rmn_type_and_version =
+                onchain_type_and_version(&rpcs[&name], afn_contract)?;
+            match (&onchain_rmn_type_and_version as &str, afn_type) {
+                ("ARM 1.0.0", crate::afn_contract::AFNType::V1_0) => Ok(()),
+                ("RMN 1.5.0-dev", crate::afn_contract::AFNType::V1_5)
+                |("RMN 1.5.0", crate::afn_contract::AFNType::V1_5)
+                => Ok(()),
+                _ => {
+                    bail!("unexpected onchain rmn contract type and version {onchain_rmn_type_and_version:?} for afn type {afn_type:?}");
+                }
+            }
+        })];
+        handles
+            .into_iter()
+            .try_for_each(|handle| handle.join().unwrap())
+    })
+}
+
 fn validate_onchain_configs(
     config: &OffchainConfig,
     rpcs: &HashMap<ChainName, Arc<Rpc>>,
 ) -> anyhow::Result<()> {
     tracing::info!("validating on-chain configs...");
     std::thread::scope(|s| {
-        let handles = config
+        let lane_handles = config
             .shared_config_by_enabled_lane
             .values()
             .map(|lane_config| {
@@ -345,7 +379,22 @@ fn validate_onchain_configs(
                 })
             })
             .collect::<Vec<_>>();
-        handles
+        let chain_handles = config
+            .shared_config_by_enabled_chain
+            .values()
+            .map(|chain_config| {
+                s.spawn(move || {
+                    tracing::info!("validating chain config {chain_config:?}...");
+                    validate_onchain_chain_config(chain_config, rpcs).with_context(|| {
+                        format!("failed to validate chain config {chain_config:?}")
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        lane_handles
+            .into_iter()
+            .try_for_each(|handle| handle.join().unwrap())?;
+        chain_handles
             .into_iter()
             .try_for_each(|handle| handle.join().unwrap())
     })
@@ -357,16 +406,16 @@ impl State {
         config: OffchainConfig,
         keys: BlessCurseKeysByChain,
         mode: VotingMode,
-        manual_curse: Option<CurseId>,
+        manual_curse: Option<BaseCurseId>,
         metrics_file_path: Option<PathBuf>,
         dangerous_allow_multiple_rpcs: bool,
         check_rpc_pruning: bool,
         curse_file_path: Option<PathBuf>,
         experimental: bool,
     ) -> Result<Self> {
-        if let Some(manual_curse_id) = manual_curse {
+        if let Some(manual_base_curse_id) = manual_curse {
             for countdown in (1..=5).rev() {
-                tracing::error!("You have started the ARM node in MANUAL CURSE MODE with curse id {manual_curse_id}. This is a potentially DESTRUCTIVE ACTION. Starting in {countdown}...");
+                tracing::error!("You have started the ARM node in MANUAL CURSE MODE with base curse id {manual_base_curse_id}. This is a potentially DESTRUCTIVE ACTION. Starting in {countdown}...");
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
@@ -497,15 +546,20 @@ impl State {
                 .iter()
                 .map(|(lane_id, ls)| (lane_id.clone(), Arc::clone(&ls.offramp_anomaly_detector)))
                 .collect();
-            let mut cursable_anomalies = CursableAnomaliesWithCurseIds::default();
-            if let Some(curse_id) = manual_curse {
-                cursable_anomalies.note(CursableAnomaly::ManualCurse(curse_id));
+            let mut cursable_anomalies_with_votable_curses =
+                CursableAnomaliesWithVotableCurses::new(
+                    config.shared_config_by_enabled_chain.clone(),
+                    config.shared_config_by_enabled_lane.clone(),
+                );
+            if let Some(base_curse_id) = manual_curse {
+                cursable_anomalies_with_votable_curses
+                    .note(CursableAnomaly::ManualGlobalCurse(base_curse_id));
             }
-            let finality_violation_global_curse_chains: HashSet<_> = config
+            let upon_finality_violation_vote_to_curse_on_other_chains_with_legacy_contracts: HashSet<_> = config
                 .shared_config_by_enabled_chain
                 .values()
                 .filter_map(|c| {
-                    c.upon_finality_violation_vote_to_curse_on_other_chains
+                    c.upon_finality_violation_vote_to_curse_on_other_chains_with_legacy_contracts
                         .then_some(c.name)
                 })
                 .collect();
@@ -513,8 +567,10 @@ impl State {
             CurseBeacon {
                 chain_status_workers,
                 offramp_anomaly_detectors,
-                finality_violation_global_curse_chains,
-                cursable_anomalies: Arc::new(RwLock::new(cursable_anomalies)),
+                upon_finality_violation_vote_to_curse_on_other_chains_with_legacy_contracts,
+                cursable_anomalies_with_votable_curses: Arc::new(RwLock::new(
+                    cursable_anomalies_with_votable_curses,
+                )),
             }
         });
 
@@ -536,6 +592,12 @@ impl State {
                     )
                 })
                 .collect();
+            let onchain_config_discovery_worker = Arc::clone(
+                &chain_states
+                    .get(&chain_name)
+                    .ok_or(anyhow!("failed to get chain state for {chain_name}"))?
+                    .config_discovery_worker,
+            );
             let afn_voting_manager =
                 shutdown_handles.add_group(AFNVotingManager::new_and_spawn_workers(
                     &ctx,
@@ -549,6 +611,7 @@ impl State {
                     mode,
                     metrics.sent_bless_txs.make_handle(chain_name),
                     curse_file.clone(),
+                    onchain_config_discovery_worker,
                 )?);
             afn_voting_managers.insert(chain_name, afn_voting_manager);
         }
@@ -563,7 +626,6 @@ impl State {
                             offramp_anomaly_detector: Arc::clone(
                                 &lane_state.offramp_anomaly_detector,
                             ),
-                            source_bless_worker: Arc::clone(&lane_state.source_bless_worker),
                             dest_offramp_worker: Arc::clone(&lane_state.dest_offramp_worker),
                         },
                     )
@@ -669,7 +731,11 @@ impl State {
                     .unwrap()
                     .clone();
                 if let Some(lane_bless_status) = lane_bless_status {
-                    Some(lane_bless_status.verified_tagged_roots.len())
+                    Some(
+                        lane_bless_status
+                            .verified_tagged_roots_with_not_yet_executed_msgs
+                            .len(),
+                    )
                 } else {
                     None
                 }
