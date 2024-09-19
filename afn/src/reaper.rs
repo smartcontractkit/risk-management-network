@@ -3,14 +3,13 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     common::LaneId,
     config,
-    contract_event_state_machine::{DestOffRampWorker, SourceBlessWorker},
+    contract_event_state_machine::DestOffRampWorker,
     offramp_anomaly_detector::OffRampAnomalyDetector,
     worker::{Context, ShutdownHandle},
 };
 
 pub struct ReapableLaneWorkers {
     pub offramp_anomaly_detector: Arc<OffRampAnomalyDetector>,
-    pub source_bless_worker: Arc<SourceBlessWorker>,
     pub dest_offramp_worker: Arc<DestOffRampWorker>,
 }
 

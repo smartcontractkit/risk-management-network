@@ -3,6 +3,8 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 use thiserror::Error;
 
+use std::fmt;
+
 use crate::bytes::{Address, Bytes, Bytes32};
 use crate::json_rpc::{
     Call, CallResponse, JsonRpc, JsonRpcCall, JsonRpcError, JsonRpcNewError, JsonRpcResponseError,
@@ -98,6 +100,71 @@ pub struct EVMLog {
     pub block_number: u64,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct PolkadotBlockResponse {
+    pub block: PolkadotBlock,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct PolkadotBlock {
+    pub header: PolkadotBlockHeader,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct PolkadotBlockHeader {
+    #[serde(deserialize_with = "deserialize_hex_u64")]
+    pub number: u64,
+}
+
+pub trait PolkadotBlockRpc: BlockRpc {
+    fn polkadot_get_finalized_head(&self) -> Result<Bytes32, RpcError>;
+    fn polkadot_get_block(&self, block_hash: Bytes32) -> Result<PolkadotBlock, RpcError>;
+}
+
+impl PolkadotBlockRpc for Rpc {
+    fn polkadot_get_finalized_head(&self) -> Result<Bytes32, RpcError> {
+        let hash = self.call_one(PolkadotGetFinalizedHeadCall {})?;
+        Ok(serde_json::from_value::<Bytes32>(hash)?)
+    }
+
+    fn polkadot_get_block(&self, block_hash: Bytes32) -> Result<PolkadotBlock, RpcError> {
+        let block_response: PolkadotBlockResponse = {
+            let block_response = self.call_one(PolkadotGetBlockCall { block_hash })?;
+            serde_json::from_value(block_response)?
+        };
+        Ok(block_response.block)
+    }
+}
+
+struct PolkadotGetFinalizedHeadCall {}
+
+impl From<PolkadotGetFinalizedHeadCall> for Call {
+    fn from(_val: PolkadotGetFinalizedHeadCall) -> Self {
+        let method = "chain_getFinalizedHead".into();
+        Call {
+            method,
+            params: vec![],
+        }
+    }
+}
+
+struct PolkadotGetBlockCall {
+    block_hash: Bytes32,
+}
+
+impl From<PolkadotGetBlockCall> for Call {
+    fn from(val: PolkadotGetBlockCall) -> Self {
+        let method = "chain_getBlock".into();
+        Call {
+            method,
+            params: vec![json!(val.block_hash)],
+        }
+    }
+}
+
 pub trait BlockRpc: Sync + Send {
     fn get_block(&self, identifier: BlockIdentifier) -> Result<Block, RpcError>;
 
@@ -105,6 +172,16 @@ pub trait BlockRpc: Sync + Send {
         &self,
         identifiers: &[BlockIdentifier],
     ) -> Result<Vec<Result<Block, RpcError>>, RpcError>;
+}
+
+pub trait LogsRpc: Sync + Send {
+    fn get_logs(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        addresses: &[Address],
+        first_topics: &[Bytes32],
+    ) -> Result<Vec<EVMLog>, RpcError>;
 }
 
 #[derive(Debug)]
@@ -124,19 +201,20 @@ pub enum BlockIdentifier {
     Pending,
 }
 
-impl ToString for BlockIdentifier {
-    fn to_string(&self) -> String {
+impl fmt::Display for BlockIdentifier {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Height(u) => hex_number(*u),
-            Self::Hash(h) => h.to_string(),
-            Self::Latest => "latest".into(),
-            Self::Earliest => "earliest".into(),
-            Self::Safe => "safe".into(),
-            Self::Finalized => "finalized".into(),
-            Self::Pending => "pending".into(),
+            Self::Height(u) => write!(f, "{}", hex_number(*u)),
+            Self::Hash(h) => write!(f, "{}", h),
+            Self::Latest => write!(f, "latest"),
+            Self::Earliest => write!(f, "earliest"),
+            Self::Safe => write!(f, "safe"),
+            Self::Finalized => write!(f, "finalized"),
+            Self::Pending => write!(f, "pending"),
         }
     }
 }
+
 impl Serialize for BlockIdentifier {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_string())
@@ -170,14 +248,22 @@ struct GetLogsCall {
 
 impl From<GetLogsCall> for Call {
     fn from(val: GetLogsCall) -> Call {
+        let mut params = json!({
+            "fromBlock": BlockIdentifier::Height(val.from_block),
+            "toBlock": BlockIdentifier::Height(val.to_block),
+        });
+
+        if !val.addresses.is_empty() {
+            params["address"] = json!(val.addresses);
+        }
+
+        if !val.first_topics.is_empty() {
+            params["topics"] = json!([val.first_topics]);
+        }
+
         Call {
             method: "eth_getLogs".into(),
-            params: vec![json!({
-                "fromBlock": BlockIdentifier::Height(val.from_block),
-                "toBlock": BlockIdentifier::Height(val.to_block),
-                "address": val.addresses,
-                "topics": [val.first_topics.iter().collect::<Vec<_>>()],
-            })],
+            params: vec![params],
         }
     }
 }
@@ -404,8 +490,10 @@ impl Rpc {
             gas: None,
         })?)?)
     }
+}
 
-    pub fn get_logs(
+impl LogsRpc for Rpc {
+    fn get_logs(
         &self,
         from_block: u64,
         to_block: u64,
@@ -451,7 +539,9 @@ impl Rpc {
             Err(_) => Err(JsonRpcError::IncompleteBatch.into()),
         }
     }
+}
 
+impl Rpc {
     pub fn send_raw_transaction(&self, raw_tx: Bytes) -> Result<Bytes32, RpcError> {
         Ok(serde_json::from_value(
             self.call_one(SendRawTransactionCall { raw_tx })?,

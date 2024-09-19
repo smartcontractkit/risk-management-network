@@ -1,24 +1,24 @@
 use afn::{
     afn_voting_manager::VotingMode,
-    config::{load_config_files, OffchainConfig},
-    curse_beacon::CurseId,
+    common::ChainName,
+    config::{find_duplicate, load_config_files, OffchainConfig},
+    curse_beacon::BaseCurseId,
     encryption::EncryptedSecrets,
     forensics::LogRotate,
     key_types::{BlessCurseKeys, BlessCurseKeysByChain},
-    state,
-    state::MonitorResult,
+    state::{self, MonitorResult},
     worker,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use argh::FromArgs;
 use minieth::{
     bytes::{Address, Bytes},
     u256::U256,
 };
 use std::{
+    collections::HashSet,
     env::{self, VarError},
-    fs::{self},
-    io::{self},
+    fs, io,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
@@ -28,13 +28,26 @@ use tracing::{error, warn};
 
 const LOG_JSON_ENV_VAR: &str = "AFN_LOG_JSON";
 const PASSPHRASE_ENV_VAR: &str = "AFN_PASSPHRASE";
+const PASSPHRASE_NEW_ENV_VAR: &str = "AFN_PASSPHRASE_NEW";
 const METRICS_FILE_PATH_ENV_VAR: &str = "AFN_METRICS_FILE";
 const CURSE_FILE_ENV_VAR: &str = "AFN_CURSE_FILE";
 
+fn read_env_var_not_empty(env_var: &str, what: &str) -> Result<String> {
+    let value = env::var(env_var)
+        .with_context(|| anyhow!("need to set {what} with the {env_var} env variable"))?;
+    ensure!(
+        !value.is_empty(),
+        "{what} set with the {env_var} env variable cannot be empty"
+    );
+    Ok(value)
+}
+
 fn user_passphrase() -> Result<String> {
-    env::var(PASSPHRASE_ENV_VAR).with_context(|| {
-        anyhow!("need to set a passphrase with the {PASSPHRASE_ENV_VAR} env variable")
-    })
+    read_env_var_not_empty(PASSPHRASE_ENV_VAR, "a passphrase")
+}
+
+fn user_passphrase_new() -> Result<String> {
+    read_env_var_not_empty(PASSPHRASE_NEW_ENV_VAR, "a new passphrase")
 }
 
 fn metrics_file_path() -> Result<Option<PathBuf>> {
@@ -124,7 +137,7 @@ fn setup_tracing() -> Result<()> {
 fn run_afn(
     voting_mode: VotingMode,
     keystore_path: Option<String>,
-    manual_curse: Option<CurseId>,
+    manual_curse: Option<BaseCurseId>,
     dangerous_allow_multiple_rpcs: bool,
     check_rpc_pruning: bool,
     experimental: bool,
@@ -180,12 +193,13 @@ fn run_afn(
     }
 }
 
-fn parse_manual_curse_id(s: &str) -> Result<CurseId, String> {
-    match CurseId::from_str(s) {
-        Ok(curse_id) => Ok(curse_id),
-        Err(e) => Err(format!("Failed to parse curse id {s:?} due to error: {e}\n\n\
-        NOTE: the curse id should be a 32-byte hex-encoded value such as 0x________________________________________________________________\n\
-        We ask you to choose a value so as to avoid accidental duplicate curses where this command is run multiple times by accident. \
+fn parse_manual_base_curse_id(s: &str) -> Result<BaseCurseId, String> {
+    match BaseCurseId::from_str(s) {
+        Ok(base_curse_id) => Ok(base_curse_id),
+        Err(e) => Err(format!("Failed to parse base curse id {s:?} due to error: {e}\n\n\
+        NOTE: the base curse id should be a 16-byte hex-encoded value such as 0x00000000________________________\n\
+        The first 4 bytes of the base curse id MUST be all zeros. We ask you to choose a value so as to avoid accidental \
+        duplicate curses where this command is run multiple times by accident. \
         If you're not sure how to set it, just pick a new random value for each curseable incident.")),
     }
 }
@@ -207,13 +221,17 @@ struct Run {
     keystore: Option<String>,
     #[argh(
         option,
-        arg_name = "curse-id",
-        description = "NOTE: the curse id should be a 32-byte hex-encoded value such as 0x________________________________________________________________ \
+        arg_name = "base-curse-id",
+        description = "NOTE: the base curse id should be a 16-byte hex-encoded value such as 0x00000000________________________ \
+        The first 4 bytes of the base curse id MUST be all zeros. When voting to curse on a specific RMN contract: \
+        If the RMN contract is of version V1.5, the curse id will be the base curse id with first 4 bytes filled with the big-endian encoding of the RMN contract's on-chain config version number.\
+        And when RMN contract's on-chain config version changes while the RMN node is sending curse vote, the RMN node will repeat the curse vote with a new curse id derived from the new config version.\
+        If the RMN contract is of version V1.0, the curse id will be the base curse id as-is. \
         We ask you to choose a value so as to avoid accidental duplicate curses where this command is run multiple times by accident. \
         If you're not sure how to set it, just pick a new random value for each curseable incident.",
-        from_str_fn(parse_manual_curse_id)
+        from_str_fn(parse_manual_base_curse_id)
     )]
-    manual_curse: Option<CurseId>,
+    manual_curse: Option<BaseCurseId>,
     #[argh(
         switch,
         description = "allow more than 1 RPC endpoints configured per chain. \
@@ -273,18 +291,21 @@ struct GenKeystore {
 }
 impl ExecutableCmd for GenKeystore {
     fn execute_cmd(&self) -> Result<()> {
+        let passphrase = user_passphrase()?;
         let enabled_chains = load_config_files()?.enabled_chains();
         eprintln!("generating keys for chains: {:?}", enabled_chains);
         let bless_curse_keys_by_chain = BlessCurseKeysByChain::generate(&enabled_chains);
+        let encrypted = bless_curse_keys_by_chain.encrypt(&passphrase)?;
+        write_encrypted_secrets(&self.out, &encrypted)?;
+
         for chain_name in enabled_chains {
             let secret_keys = bless_curse_keys_by_chain
                 .get(chain_name)
                 .ok_or_else(|| anyhow!("chain not found"))?;
             eprintln!("generated new keys for {}: {:?}", chain_name, secret_keys,);
         }
-        let encrypted = bless_curse_keys_by_chain.encrypt(&user_passphrase()?)?;
-        eprintln!("writing keystore to {}", self.out);
-        write_encrypted_secrets(&self.out, &encrypted)?;
+        eprintln!("wrote keystore to {}", self.out);
+
         Ok(())
     }
 }
@@ -293,6 +314,7 @@ impl ExecutableCmd for GenKeystore {
 #[argh(subcommand, name = "update")]
 /// Update keystore file for chains in the current config. Append new random keys for
 /// chains that required by the current config, but not in the input keystore.
+/// If --add is provided, only append keys for the specified chains.
 struct UpdateKeystore {
     /// input keystore file to update
     #[argh(positional)]
@@ -300,33 +322,102 @@ struct UpdateKeystore {
     /// output file of updated keystore
     #[argh(option, short = 'o')]
     out: String,
+    /// add chains to keystore, can be repeated to add multiple chains
+    #[argh(option)]
+    add: Vec<ChainName>,
 }
 impl ExecutableCmd for UpdateKeystore {
     fn execute_cmd(&self) -> Result<()> {
+        let passphrase = user_passphrase()?;
+
         let mut bless_curse_keys_by_chain = {
             let file = fs::File::open(&self.file_to_update)?;
-            let keystore_reader = io::BufReader::new(file);
-            BlessCurseKeysByChain::from_reader(keystore_reader, &user_passphrase()?)?
+            BlessCurseKeysByChain::from_reader(io::BufReader::new(file), &passphrase)?
         };
-        let enabled_chains = load_config_files()?.enabled_chains();
-        for &chain_name in enabled_chains.iter() {
-            if bless_curse_keys_by_chain.get(chain_name).is_none() {
-                let secret_keys = BlessCurseKeys::generate();
-                eprintln!("generated new keys for {}: {:?}", chain_name, secret_keys,);
-                bless_curse_keys_by_chain.insert(chain_name, secret_keys);
+
+        let new_chain_names: HashSet<ChainName> = if self.add.is_empty() {
+            let enabled_chains = load_config_files()?.enabled_chains();
+            for chain_name in bless_curse_keys_by_chain.chains() {
+                if !enabled_chains.contains(&chain_name) {
+                    eprintln!(
+                        "keystore contains keys for chain {}, which is not enabled in the config",
+                        chain_name
+                    );
+                }
             }
-        }
-        for chain_name in bless_curse_keys_by_chain.chains() {
-            if !enabled_chains.contains(&chain_name) {
-                eprintln!(
-                    "keystore contains keys for unsupported chain {}",
-                    chain_name
+            enabled_chains
+                .into_iter()
+                .filter(|&chain| bless_curse_keys_by_chain.get(chain).is_none())
+                .collect()
+        } else {
+            if let Some((_, name)) = find_duplicate(&self.add, |&c| c) {
+                bail!(
+                    "duplicate --add {}, cannot add a chain more than once",
+                    name
                 );
             }
+            self.add
+                .iter()
+                .filter(|&&chain| {
+                    if bless_curse_keys_by_chain.get(chain).is_none() {
+                        true
+                    } else {
+                        eprintln!("keystore contains keys for chain {}, skipping", chain);
+                        false
+                    }
+                })
+                .cloned()
+                .collect()
+        };
+
+        for &chain_name in &new_chain_names {
+            let secret_keys = BlessCurseKeys::generate();
+            bless_curse_keys_by_chain.insert(chain_name, secret_keys);
         }
-        let keystore = bless_curse_keys_by_chain.encrypt(&user_passphrase()?)?;
-        eprintln!("writing updated keystore to {}", self.out);
+        let keystore = bless_curse_keys_by_chain.encrypt(&passphrase)?;
         write_encrypted_secrets(&self.out, &keystore)?;
+
+        for chain_name in new_chain_names {
+            let secret_keys = bless_curse_keys_by_chain
+                .get(chain_name)
+                .ok_or_else(|| anyhow!("assumption violation: chain {chain_name} in new_chains is not part of the updated bless_curse_keys_by_chain"))?;
+            eprintln!("generated new keys for {}: {:?}", chain_name, secret_keys,);
+        }
+        eprintln!("wrote updated keystore to {}", self.out);
+
+        Ok(())
+    }
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand, name = "reencrypt")]
+/// Reencrypt keystore file with a new passphrase
+struct ReencryptKeystore {
+    /// input keystore file to reencrypt
+    #[argh(positional)]
+    file_to_update: String,
+    /// output file of re-encrypted keystore
+    #[argh(option, short = 'o')]
+    out: String,
+}
+impl ExecutableCmd for ReencryptKeystore {
+    fn execute_cmd(&self) -> Result<()> {
+        let current_passphrase = user_passphrase()?;
+        let new_passphrase = user_passphrase_new()?;
+        ensure!(
+            current_passphrase != new_passphrase,
+            "new passphrase is the same as the current passphrase"
+        );
+
+        let bless_curse_keys_by_chain = {
+            let file = fs::File::open(&self.file_to_update)?;
+            BlessCurseKeysByChain::from_reader(io::BufReader::new(file), &current_passphrase)?
+        };
+
+        let keystore = bless_curse_keys_by_chain.encrypt(&new_passphrase)?;
+        write_encrypted_secrets(&self.out, &keystore)?;
+        eprintln!("wrote re-encrypted keystore to {}", self.out);
+
         Ok(())
     }
 }
@@ -444,7 +535,7 @@ impl ExecutableCmd for SignManualTransaction {
         };
 
         let mut key = None;
-        for keys in bless_curse_keys_by_chain.0.values() {
+        for keys in bless_curse_keys_by_chain.keys() {
             if keys.bless.address() == self.from {
                 key = Some(keys.bless);
                 break;
@@ -470,7 +561,7 @@ impl ExecutableCmd for SignManualTransaction {
                 self.from, tx_request
             );
             let tx_bytes = tx_request.sign(&key.local_signer()).to_rlp_bytes();
-            eprintln!("signed transaction = {}", Bytes::from(tx_bytes).to_string());
+            eprintln!("signed transaction = {}", Bytes::from(tx_bytes));
             Ok(())
         } else {
             bail!(
@@ -487,6 +578,7 @@ impl ExecutableCmd for SignManualTransaction {
 enum KeystoreCmd {
     Gen(GenKeystore),
     Update(UpdateKeystore),
+    Reencrypt(ReencryptKeystore),
     Addrs(AddrsKeystore),
     SignManualTransaction(SignManualTransaction),
 }
@@ -495,6 +587,7 @@ impl ExecutableCmd for KeystoreCmd {
         match self {
             Self::Gen(gen) => gen.execute_cmd(),
             Self::Update(update) => update.execute_cmd(),
+            Self::Reencrypt(reencrypt) => reencrypt.execute_cmd(),
             Self::Addrs(addrs) => addrs.execute_cmd(),
             Self::SignManualTransaction(sign_manual_tx) => sign_manual_tx.execute_cmd(),
         }

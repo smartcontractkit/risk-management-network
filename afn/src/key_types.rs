@@ -6,6 +6,7 @@ use minieth::{bytes::SizedBytes, ecdsa::LocalSigner};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
+use std::str::FromStr;
 
 const EVM_SECRET_KEY_SIZE: usize = 32;
 
@@ -77,20 +78,31 @@ impl BlessCurseKeys {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BlessCurseKeysByChain(pub HashMap<ChainName, BlessCurseKeys>);
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlessCurseKeysByChain(HashMap<String, BlessCurseKeys>);
+
+impl From<HashMap<ChainName, BlessCurseKeys>> for BlessCurseKeysByChain {
+    fn from(by_chain_name: HashMap<ChainName, BlessCurseKeys>) -> Self {
+        BlessCurseKeysByChain(
+            by_chain_name
+                .into_iter()
+                .map(|(chain, keys)| (chain.to_string(), keys))
+                .collect(),
+        )
+    }
+}
 
 impl BlessCurseKeysByChain {
     pub fn generate(chains: &[ChainName]) -> BlessCurseKeysByChain {
         let mut by_chain = HashMap::new();
         for &chain in chains {
-            by_chain.insert(chain, BlessCurseKeys::generate());
+            by_chain.insert(chain.to_string(), BlessCurseKeys::generate());
         }
         BlessCurseKeysByChain(by_chain)
     }
 
     pub fn get(&self, chain_name: ChainName) -> Option<&BlessCurseKeys> {
-        self.0.get(&chain_name)
+        self.0.get(&chain_name.to_string())
     }
 
     pub fn insert(
@@ -98,11 +110,18 @@ impl BlessCurseKeysByChain {
         chain_name: ChainName,
         bless_curse_keys: BlessCurseKeys,
     ) -> Option<BlessCurseKeys> {
-        self.0.insert(chain_name, bless_curse_keys)
+        self.0.insert(chain_name.to_string(), bless_curse_keys)
     }
 
     pub fn chains(&self) -> Vec<ChainName> {
-        self.0.keys().cloned().collect()
+        self.0
+            .keys()
+            .filter_map(|s| ChainName::from_str(s).ok())
+            .collect()
+    }
+
+    pub fn keys(&self) -> Vec<BlessCurseKeys> {
+        self.0.values().cloned().collect()
     }
 
     pub fn from_reader(reader: impl std::io::Read, passphrase: &str) -> Result<Self> {
@@ -119,5 +138,27 @@ impl BlessCurseKeysByChain {
     pub fn decrypt(keystore: &EncryptedSecrets, passphrase: &str) -> Result<Self> {
         let data = keystore.decrypt(passphrase)?;
         Ok(serde_json::from_slice(&data)?)
+    }
+}
+
+impl Debug for BlessCurseKeysByChain {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[derive(PartialEq, Eq, Hash)]
+        struct UnquoteString<'a>(&'a str);
+        impl<'a> Debug for UnquoteString<'a> {
+            fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                fmt.write_str(self.0)
+            }
+        }
+
+        fmt.debug_tuple("BlessCurseKeysByChain")
+            .field(
+                &self
+                    .0
+                    .iter()
+                    .map(|(k, v)| (UnquoteString(k), v))
+                    .collect::<HashMap<_, _>>(),
+            )
+            .finish()
     }
 }

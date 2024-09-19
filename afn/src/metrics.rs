@@ -5,6 +5,7 @@ use core::hash::Hash;
 use minieth::{rpc::Rpc, tx_sender::TransactionSenderFeeConfig, u256::U256};
 use std::{
     collections::HashMap,
+    fmt,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -72,13 +73,12 @@ enum MetricType {
     Counter,
     Gauge,
 }
-impl ToString for MetricType {
-    fn to_string(&self) -> String {
+impl fmt::Display for MetricType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Counter => "counter",
-            Self::Gauge => "gauge",
+            Self::Counter => write!(f, "counter"),
+            Self::Gauge => write!(f, "gauge"),
         }
-        .to_string()
     }
 }
 
@@ -415,6 +415,8 @@ pub struct ChainStatusMetrics {
     latest_block_number: MetricTypeGauge<ChainName>,
     finalized_block_number: MetricTypeGauge<ChainName>,
     finality_violated: MetricTypeGauge<ChainName>,
+    latest_block_timestamp: MetricTypeGauge<ChainName>,
+    finalized_block_timestamp: MetricTypeGauge<ChainName>,
 }
 
 impl ChainStatusMetrics {
@@ -429,10 +431,20 @@ impl ChainStatusMetrics {
             "rmn_finality_violated",
             "boolean flag (0/1) indicating whether a chain has suffered a finality violation since startup",
         );
+        let latest_block_timestamp = MetricTypeGauge::new(
+            "rmn_latest_block_timestamp",
+            "latest block timestamp (epoch seconds)",
+        );
+        let finalized_block_timestamp = MetricTypeGauge::new(
+            "rmn_finalized_block_timestamp",
+            "finalized block timestamp (epoch seconds)",
+        );
         Self {
             latest_block_number,
             finalized_block_number,
             finality_violated,
+            latest_block_timestamp,
+            finalized_block_timestamp,
         }
     }
     fn get_prometheus_file_lines(&self) -> Vec<String> {
@@ -440,6 +452,8 @@ impl ChainStatusMetrics {
             self.latest_block_number.get_prometheus_file_lines(),
             self.finalized_block_number.get_prometheus_file_lines(),
             self.finality_violated.get_prometheus_file_lines(),
+            self.latest_block_timestamp.get_prometheus_file_lines(),
+            self.finalized_block_timestamp.get_prometheus_file_lines(),
         ])
     }
     pub fn make_handle(&mut self, chain_name: ChainName) -> ChainStatusMetricsHandle {
@@ -447,6 +461,8 @@ impl ChainStatusMetrics {
             latest_block_number: self.latest_block_number.make_handle(chain_name),
             finalized_block_number: self.finalized_block_number.make_handle(chain_name),
             finality_violated: self.finality_violated.make_handle(chain_name),
+            latest_block_timestamp: self.latest_block_timestamp.make_handle(chain_name),
+            finalized_block_timestamp: self.finalized_block_timestamp.make_handle(chain_name),
         }
     }
 }
@@ -456,6 +472,8 @@ pub struct ChainStatusMetricsHandle {
     pub latest_block_number: MetricTypeGaugeHandle,
     pub finalized_block_number: MetricTypeGaugeHandle,
     pub finality_violated: MetricTypeGaugeHandle,
+    pub latest_block_timestamp: MetricTypeGaugeHandle,
+    pub finalized_block_timestamp: MetricTypeGaugeHandle,
 }
 
 pub struct GasFeeMetrics {

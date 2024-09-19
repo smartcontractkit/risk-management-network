@@ -4,8 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use minieth::bytes::{Address, Bytes32};
-use minieth::rpc::{Rpc, RpcError};
+use minieth::rpc::RpcError;
+use minieth::{
+    bytes::{Address, Bytes32},
+    rpc::LogsRpc,
+};
 
 use crate::cached_rpc::PartialLogs;
 use crate::worker::worker_name;
@@ -43,7 +46,7 @@ impl BlockRange {
 }
 
 pub struct SmartGetLogs {
-    rpc: Arc<Rpc>,
+    rpc: Arc<dyn LogsRpc>,
     addresses: Vec<Address>,
     first_topics: Vec<Bytes32>,
 
@@ -53,7 +56,7 @@ pub struct SmartGetLogs {
 const SOFT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl SmartGetLogs {
-    pub fn new(rpc: Arc<Rpc>, addresses: Vec<Address>, first_topics: Vec<Bytes32>) -> Self {
+    pub fn new(rpc: Arc<dyn LogsRpc>, addresses: Vec<Address>, first_topics: Vec<Bytes32>) -> Self {
         Self {
             rpc,
             addresses,

@@ -133,6 +133,7 @@ impl<const N: usize> quickcheck::Arbitrary for SizedBytes<N> {
     }
 }
 
+pub type Bytes16 = SizedBytes<16>;
 pub type Bytes20 = SizedBytes<20>;
 pub type Bytes32 = SizedBytes<32>;
 
@@ -200,9 +201,9 @@ impl RlpEncodable for Bytes {
     }
 }
 
-impl ToString for Bytes {
-    fn to_string(&self) -> String {
-        hex::encode(self.as_ref())
+impl fmt::Display for Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.as_ref()))
     }
 }
 

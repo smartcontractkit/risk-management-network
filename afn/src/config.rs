@@ -1,4 +1,5 @@
 use crate::{
+    afn_contract::AFNType,
     common::{ChainName, LaneId},
     forensics::LogRotateConfig,
 };
@@ -61,9 +62,11 @@ pub enum ChainStability {
     FinalityTag {
         soft_confirmations: u64,
     },
+    PolkadotGetFinalizedHead,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SharedChainConfig {
     pub name: ChainName,
     pub stability: ChainStability,
@@ -71,19 +74,29 @@ pub struct SharedChainConfig {
     pub curse_fee_config: TransactionSenderFeeConfig,
     pub max_tagged_roots_per_vote_to_bless: usize,
     pub afn_contract: Address,
+    pub afn_type: AFNType,
     pub inflight_time: TimeUnit,
     pub max_fresh_block_age: TimeUnit,
     #[serde(default)]
-    pub upon_finality_violation_vote_to_curse_on_other_chains: bool,
+    pub upon_finality_violation_vote_to_curse_on_other_chains_with_legacy_contracts: bool,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum LaneType {
-    Evm2EvmV1_0,
     Evm2EvmV1_2,
+    Evm2EvmV1_5,
+}
+impl LaneType {
+    pub fn is_legacy(&self) -> bool {
+        match self {
+            Self::Evm2EvmV1_2 => true,
+            Self::Evm2EvmV1_5 => false,
+        }
+    }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
 pub struct SharedLaneConfig {
     #[serde(flatten)]
     pub lane_id: LaneId,
@@ -112,6 +125,7 @@ impl From<(ChainName, Address)> for QualifiedAddress {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalChainConfig {
     pub name: ChainName,
     #[serde(default)]
@@ -135,14 +149,14 @@ impl From<TimeUnit> for Duration {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct LocalOffchainConfig {
-    chains: Vec<LocalChainConfig>,
+pub struct LocalOffchainConfig {
+    pub chains: Vec<LocalChainConfig>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-struct SharedOffchainConfig {
-    chains: Vec<SharedChainConfig>,
-    lanes: Vec<SharedLaneConfig>,
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedOffchainConfig {
+    pub chains: Vec<SharedChainConfig>,
+    pub lanes: Vec<SharedLaneConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,7 +298,7 @@ impl OffchainConfig {
     }
 }
 
-fn find_duplicate<T, K: Eq + Hash, F>(list: &[T], key_fn: F) -> Option<(&T, K)>
+pub fn find_duplicate<T, K: Eq + Hash, F>(list: &[T], key_fn: F) -> Option<(&T, K)>
 where
     F: Fn(&T) -> K,
 {

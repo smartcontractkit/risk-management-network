@@ -1,12 +1,12 @@
-use miniabi::{
-    abi_decode::{AbiDecode, AbiDecodeError, AbiTypeToDecode},
-    types::{Type, Value},
-};
+use miniabi::{abi_decode::AbiDecode, types::Value};
 use minieth::{bytes::Address, rpc::Rpc};
 
 use crate::{
     chain_selector::ChainSelector,
+    commit_store,
     common::{ContractCall, EncodeContractCall},
+    config::LaneType,
+    evm2evm_offramp_v1_2, evm2evm_offramp_v1_5, evm2evm_onramp_v1_2, evm2evm_onramp_v1_5,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -15,30 +15,25 @@ pub struct OnRampStaticConfig {
     pub dest_chain_selector: ChainSelector,
 }
 
-type OnRampStaticConfigAsTuple = (Address, u64, u64, u64, u128, Address, Address);
+type OnRarmpStaticConfigV1_2 = evm2evm_onramp_v1_2::StaticConfigV1_2;
 
-impl AbiTypeToDecode for OnRampStaticConfig {
-    fn abi_type_to_decode() -> Type {
-        OnRampStaticConfigAsTuple::abi_type_to_decode()
+impl From<OnRarmpStaticConfigV1_2> for OnRampStaticConfig {
+    fn from(value: OnRarmpStaticConfigV1_2) -> Self {
+        Self {
+            chain_selector: value.chain_selector,
+            dest_chain_selector: value.dest_chain_selector,
+        }
     }
 }
 
-impl TryFrom<Value> for OnRampStaticConfig {
-    type Error = AbiDecodeError;
-    fn try_from(v: Value) -> Result<Self, Self::Error> {
-        let (
-            _link_token,
-            chain_selector,
-            dest_chain_selector,
-            _default_tx_gas_limit,
-            _max_nop_fees_juels,
-            _prev_onramp,
-            _arm_proxy,
-        ) = OnRampStaticConfigAsTuple::try_from(v)?;
-        Ok(Self {
-            chain_selector,
-            dest_chain_selector,
-        })
+type OnRampStaticConfigV1_5 = evm2evm_onramp_v1_5::StaticConfigV1_5;
+
+impl From<OnRampStaticConfigV1_5> for OnRampStaticConfig {
+    fn from(value: OnRampStaticConfigV1_5) -> Self {
+        Self {
+            chain_selector: value.chain_selector,
+            dest_chain_selector: value.dest_chain_selector,
+        }
     }
 }
 
@@ -50,55 +45,33 @@ pub struct OffRampStaticConfig {
     pub on_ramp: Address,
 }
 
-type OffRampStaticConfigAsTuple = (Address, u64, u64, Address, Address, Address);
+type OffRampStaticConfigV1_2 = evm2evm_offramp_v1_2::StaticConfigV1_2;
 
-impl AbiTypeToDecode for OffRampStaticConfig {
-    fn abi_type_to_decode() -> Type {
-        OffRampStaticConfigAsTuple::abi_type_to_decode()
+impl From<OffRampStaticConfigV1_2> for OffRampStaticConfig {
+    fn from(value: OffRampStaticConfigV1_2) -> Self {
+        Self {
+            chain_selector: value.chain_selector,
+            src_chain_selector: value.src_chain_selector,
+            commit_store: value.commit_store,
+            on_ramp: value.on_ramp,
+        }
     }
 }
 
-impl TryFrom<Value> for OffRampStaticConfig {
-    type Error = AbiDecodeError;
-    fn try_from(v: Value) -> Result<Self, Self::Error> {
-        let (commit_store, chain_selector, src_chain_selector, on_ramp, _prev_off_ramp, _arm_proxy) =
-            OffRampStaticConfigAsTuple::try_from(v)?;
-        Ok(Self {
-            chain_selector,
-            src_chain_selector,
-            commit_store,
-            on_ramp,
-        })
+type OffRampStaticConfigV1_5 = evm2evm_offramp_v1_5::StaticConfigV1_5;
+
+impl From<OffRampStaticConfigV1_5> for OffRampStaticConfig {
+    fn from(value: OffRampStaticConfigV1_5) -> Self {
+        Self {
+            chain_selector: value.chain_selector,
+            src_chain_selector: value.src_chain_selector,
+            commit_store: value.commit_store,
+            on_ramp: value.on_ramp,
+        }
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct CommitStoreStaticConfig {
-    pub chain_selector: ChainSelector,
-    pub src_chain_selector: ChainSelector,
-    pub on_ramp: Address,
-}
-
-type CommitStoreStaticConfigAsTuple = (u64, u64, Address, Address);
-
-impl AbiTypeToDecode for CommitStoreStaticConfig {
-    fn abi_type_to_decode() -> Type {
-        CommitStoreStaticConfigAsTuple::abi_type_to_decode()
-    }
-}
-
-impl TryFrom<Value> for CommitStoreStaticConfig {
-    type Error = AbiDecodeError;
-    fn try_from(v: Value) -> Result<Self, Self::Error> {
-        let (chain_selector, src_chain_selector, on_ramp, _arm_proxy) =
-            CommitStoreStaticConfigAsTuple::try_from(v)?;
-        Ok(Self {
-            chain_selector,
-            src_chain_selector,
-            on_ramp,
-        })
-    }
-}
+pub type CommitStoreStaticConfig = commit_store::StaticConfig;
 
 struct GetStaticConfig();
 
@@ -122,15 +95,35 @@ fn fetch_onchain_static_config<T: AbiDecode>(rpc: &Rpc, contract: Address) -> an
 pub fn onchain_onramp_static_config(
     rpc: &Rpc,
     on_ramp: Address,
+    lane_type: LaneType,
 ) -> anyhow::Result<OnRampStaticConfig> {
-    fetch_onchain_static_config(rpc, on_ramp)
+    match lane_type {
+        LaneType::Evm2EvmV1_2 => {
+            fetch_onchain_static_config::<OnRarmpStaticConfigV1_2>(rpc, on_ramp)
+                .map(OnRampStaticConfig::from)
+        }
+        LaneType::Evm2EvmV1_5 => {
+            fetch_onchain_static_config::<OnRampStaticConfigV1_5>(rpc, on_ramp)
+                .map(OnRampStaticConfig::from)
+        }
+    }
 }
 
 pub fn onchain_offramp_static_config(
     rpc: &Rpc,
     off_ramp: Address,
+    lane_type: LaneType,
 ) -> anyhow::Result<OffRampStaticConfig> {
-    fetch_onchain_static_config(rpc, off_ramp)
+    match lane_type {
+        LaneType::Evm2EvmV1_2 => {
+            fetch_onchain_static_config::<OffRampStaticConfigV1_2>(rpc, off_ramp)
+                .map(OffRampStaticConfig::from)
+        }
+        LaneType::Evm2EvmV1_5 => {
+            fetch_onchain_static_config::<OffRampStaticConfigV1_5>(rpc, off_ramp)
+                .map(OffRampStaticConfig::from)
+        }
+    }
 }
 
 pub fn onchain_commit_store_static_config(

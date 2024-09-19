@@ -1,5 +1,5 @@
 use anyhow::Context;
-use minieth::keccak::keccak256;
+use minieth::{keccak::keccak256, rpc::LogsRpc};
 use rusqlite::{named_params, OptionalExtension};
 
 use std::{
@@ -13,7 +13,7 @@ use std::{
 
 use minieth::{
     bytes::{Address, Bytes32},
-    rpc::{EVMLog, Rpc},
+    rpc::EVMLog,
 };
 
 use crate::{common::ChainName, config::ChainStability, smart_get_logs::SmartGetLogs};
@@ -315,7 +315,7 @@ impl CachedRpc {
         chain: ChainName,
         addresses: &[Address],
         first_topics: Vec<Bytes32>,
-        rpc: Arc<Rpc>,
+        rpc: Arc<dyn LogsRpc>,
         chain_stability: ChainStability,
         parent_worker_name: &str,
     ) -> anyhow::Result<Self> {

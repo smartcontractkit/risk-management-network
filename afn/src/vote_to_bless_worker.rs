@@ -1,7 +1,7 @@
 use crate::{
     afn_contract::{AFNInterface, TaggedRoot},
     common::{ChainName, LaneId},
-    config::{SharedChainConfig, SharedLaneConfig},
+    config::{LaneType, SharedChainConfig, SharedLaneConfig},
     curse_beacon::CurseBeacon,
     inflight_root_cache::InflightRootCache,
     key_types::SecretKey,
@@ -10,7 +10,7 @@ use crate::{
     permutation::DELTA_STAGE,
     worker,
 };
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use minieth::{rpc::Rpc, tx_sender::TransactionSender};
 use std::{
     cmp::{min, Reverse},
@@ -80,7 +80,7 @@ impl VoteToBlessWorker {
             move |ctx, worker_name| -> Result<()> {
                 let worker_name = worker_name.to_owned();
                 let bless_vote_addr = key.address();
-                let lane_id_by_commit_store : HashMap<_,_>= lane_configs.into_iter().map(|(lane_id,lane_config)| (lane_config.commit_store, lane_id)).collect();
+                let lane_id_and_type_by_commit_store : HashMap<_,_>= lane_configs.iter().map(|(lane_id,lane_config)| (lane_config.commit_store, (lane_id.clone(), lane_config.lane_type))).collect();
                 let afn_contract =
                     AFNInterface::create_from_chain_config(Arc::clone(&rpc), &config)?;
                 let mut tx_sender = TransactionSender::new(
@@ -94,10 +94,13 @@ impl VoteToBlessWorker {
                 let mut queue = VoteQueue::default();
 
                 let sorted_lane_bless_status_workers = {
-                    let mut lane_bless_status_workers =
-                        lane_bless_status_workers.into_iter().collect::<Vec<_>>();
-                    lane_bless_status_workers.sort_by_key(|(lane_id, _)| lane_id.clone());
-                    lane_bless_status_workers
+                    let mut sorted_lane_bless_status_workers = vec![];
+                    for (lane_id, worker) in lane_bless_status_workers {
+                        let lane_type = lane_configs.get(&lane_id).ok_or(anyhow!("{worker_name}: lane config not found for {lane_id}"))?.lane_type;
+                        sorted_lane_bless_status_workers.push((lane_id, lane_type, worker));
+                    }
+                    sorted_lane_bless_status_workers.sort_by_key(|(lane_id, _, _)| lane_id.clone());
+                    sorted_lane_bless_status_workers
                 };
 
                 ctx.repeat(worker_name.clone(), Duration::ZERO, move |ctx| {
@@ -129,8 +132,8 @@ impl VoteToBlessWorker {
                         let mut batch = Vec::new();
                         while batch.len() < config.max_tagged_roots_per_vote_to_bless {
                             if let Some(tagged_root) = queue.pop() {
-                                if let Some(lane_id) = lane_id_by_commit_store.get(&tagged_root.commit_store){
-                                    if votable.contains(&tagged_root) && !inflight.contains(tagged_root) && !curse_beacon.lane_is_cursed(lane_id)
+                                if let Some((lane_id, lane_type)) = lane_id_and_type_by_commit_store.get(&tagged_root.commit_store){
+                                    if votable.contains(&tagged_root) && !inflight.contains(tagged_root) && !curse_beacon.lane_is_cursed(lane_id, lane_type)
                                     {
                                         batch.push(tagged_root);
                                     }
@@ -186,19 +189,19 @@ impl VoteToBlessWorker {
     }
 
     fn get_roots_to_bless(
-        lane_bless_status_workers: &[(LaneId, Arc<LaneBlessStatusWorker>)],
+        lane_bless_status_workers: &[(LaneId, LaneType, Arc<LaneBlessStatusWorker>)],
         curse_beacon: &CurseBeacon,
     ) -> Vec<TaggedRoot> {
         lane_bless_status_workers
             .iter()
-            .filter_map(|(lane_id, worker)| {
-                if !curse_beacon.lane_is_cursed(lane_id) {
+            .filter_map(|(lane_id, lane_type, worker)| {
+                if !curse_beacon.lane_is_cursed(lane_id, lane_type) {
                     worker.lane_bless_status.lock().unwrap().clone()
                 } else {
                     None
                 }
             })
-            .flat_map(|status| status.verified_tagged_roots)
+            .flat_map(|status| status.verified_tagged_roots_with_not_yet_executed_msgs)
             .collect()
     }
 }

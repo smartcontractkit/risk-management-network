@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Result};
 use miniabi::abi_decode::AbiDecode;
 use minieth::{
     bytes::{Bytes, Bytes32},
@@ -14,10 +14,21 @@ pub enum MessageExecutionState {
     Success,
     Failure,
 }
+impl MessageExecutionState {
+    pub fn from_u8_state(state: u8) -> Result<Self> {
+        match state {
+            0 => Ok(MessageExecutionState::Untouched),
+            1 => Ok(MessageExecutionState::InProgress),
+            2 => Ok(MessageExecutionState::Success),
+            3 => Ok(MessageExecutionState::Failure),
+            _ => Err(anyhow!("unknown state {state}")),
+        }
+    }
+}
 
 pub type MessageId = Bytes32;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExecutionStateChanged {
     pub sequence_number: u64,
     pub message_id: MessageId,
@@ -39,13 +50,7 @@ impl UncheckedDecodeLog for ExecutionStateChanged {
         Ok(Self {
             sequence_number: u64::abi_decode(sequence_number)?,
             message_id,
-            state: match state {
-                0 => Ok(MessageExecutionState::Untouched),
-                1 => Ok(MessageExecutionState::InProgress),
-                2 => Ok(MessageExecutionState::Success),
-                3 => Ok(MessageExecutionState::Failure),
-                _ => Err(anyhow!("unknown state {state}")),
-            }?,
+            state: MessageExecutionState::from_u8_state(state)?,
         })
     }
 }

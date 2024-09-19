@@ -1,7 +1,7 @@
 use crate::abi_decode::AbiDecodeError;
 use crate::types::{Type, Value};
 use minieth::{
-    bytes::{Address, Bytes, Bytes32},
+    bytes::{Address, Bytes, Bytes16, Bytes32},
     u256::U256,
 };
 
@@ -40,6 +40,7 @@ impl Type {
             Type::U16 => decode_u16_helper(bytes, cursor),
             Type::U8 => decode_u8_helper(bytes, cursor),
             Type::Address => decode_address_helper(bytes, cursor),
+            Type::Bytes16 => decode_bytes16_helper(bytes, cursor),
             Type::Bytes32 => decode_bytes32_helper(bytes, cursor),
             Type::Bytes => decode_bytes_helper(bytes, cursor),
             Type::String => decode_string_helper(bytes, cursor),
@@ -135,6 +136,25 @@ fn decode_address_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, Ab
     let v: Address = address_from_32_bytes(read_first_32_bytes(bytes, cursor)?)?;
     Ok(DecodeResult {
         value: Value::Address(v),
+        new_cursor: cursor + 32,
+        size_in_bytes: 32,
+    })
+}
+
+fn bytes16_from_32_bytes(v: [u8; 32]) -> Result<Bytes16, AbiDecodeError> {
+    if !are_all_zeros(&v[16..32]) {
+        return Err(AbiDecodeError::InvalidBytesNEncoding);
+    }
+    let bytes: [u8; 16] = v[..16]
+        .try_into()
+        .or(Err(AbiDecodeError::InvalidBytesNEncoding))?;
+    Ok(Bytes16::from(bytes))
+}
+
+fn decode_bytes16_helper(bytes: &[u8], cursor: usize) -> Result<DecodeResult, AbiDecodeError> {
+    let bytes16 = bytes16_from_32_bytes(read_first_32_bytes(bytes, cursor)?)?;
+    Ok(DecodeResult {
+        value: Value::Bytes16(bytes16),
         new_cursor: cursor + 32,
         size_in_bytes: 32,
     })

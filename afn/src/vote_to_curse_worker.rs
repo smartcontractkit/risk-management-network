@@ -1,9 +1,10 @@
 use crate::{
-    afn_contract::AFNInterface,
+    afn_contract::{AFNInterface, AFNType},
     common::ChainName,
     config::SharedChainConfig,
     curse_beacon::{CurseBeacon, CurseId},
     key_types::SecretKey,
+    onchain_config_discovery_worker::OnchainConfigDiscoveryWorker,
     worker,
 };
 use anyhow::Result;
@@ -33,6 +34,7 @@ impl VoteToCurseWorker {
         curse_beacon: Arc<CurseBeacon>,
         mode: VotingMode,
         curse_file: Option<Arc<Mutex<File>>>,
+        onchain_config_discovery_worker: Arc<OnchainConfigDiscoveryWorker>,
     ) -> Result<(Self, ShutdownHandle)> {
         let worker = Self {
             chain_name: config.name,
@@ -50,60 +52,71 @@ impl VoteToCurseWorker {
                     Arc::new(key.local_signer()),
                 );
                 let mut do_not_send_vote_for_curse_id_until: HashMap<CurseId, Instant> = HashMap::new();
-
                 let worker_name = worker_name.to_owned();
                 ctx.repeat(worker_name.clone(), poll_interval, move |_ctx| {
-                    for (anomaly, curse_id) in curse_beacon.get_anomalies_and_curse_ids_for_chain(worker.chain_name) {
+                    for (anomaly, base_curse_id, curse_type) in curse_beacon.get_anomalies_and_curse_parameters_for_chain(worker.chain_name) {
+                        let curse_id = match config.afn_type {
+                            AFNType::V1_0 => base_curse_id.to_versioned_curse_id(0u32),
+                            AFNType::V1_5 => {
+                                let onchain_config_version = match onchain_config_discovery_worker.latest() {
+                                    Some(config) => config.version,
+                                    None => {
+                                        error!("{worker_name}: RMN contract on-chain config not discovered yet, using 0 as config version");
+                                        0u32
+                                    }
+                                };
+                                base_curse_id.to_versioned_curse_id(onchain_config_version)
+                            }
+                        };
                         if let Some(do_not_send_until) = do_not_send_vote_for_curse_id_until.get(&curse_id) {
                             if Instant::now() < *do_not_send_until {
                                 warn!(
-                                    "{worker_name}: skipped voting to curse for anomaly {:?} with curse id {}: \
+                                    "{worker_name}: skipped voting to curse for anomaly {:?} with curse id {} and curse type {:?}: \
                                     voted to curse too recently, can't revote for {:?}",
-                                    anomaly, curse_id, do_not_send_until.saturating_duration_since(Instant::now())
+                                    anomaly, curse_id, curse_type, do_not_send_until.saturating_duration_since(Instant::now())
                                 );
                                 continue;
                             }
                         }
-
                         error!(
-                            "{worker_name}: voting to curse due to anomaly {:?} with curse id {}",
-                            anomaly, curse_id
+                            "{worker_name}: voting to curse due to anomaly {:?} with curse id {} and curse type {:?}",
+                            anomaly, curse_id, curse_type
                         );
                         match mode {
                             VotingMode::DryRun | VotingMode::Passive => {
                                 error!(
-                                    "{worker_name}: would be voting to curse due to anomaly {:?} with curse id {} (if not in mode {:?})",
-                                    anomaly, curse_id, mode
+                                    "{worker_name}: would be voting to curse due to anomaly {:?} with curse id {} and curse type {:?} (if not in mode {:?})",
+                                    anomaly, curse_id, curse_type, mode
                                 );
                             }
                             VotingMode::UnreliableRemote => {
                                 error!(
-                                    "{worker_name}: would be voting to curse due to anomaly {:?} with curse id {} (if not in mode {:?})",
-                                    anomaly, curse_id, mode
+                                    "{worker_name}: would be voting to curse due to anomaly {:?} with curse id {} and curse type {:?} (if not in mode {:?})",
+                                    anomaly, curse_id, curse_type, mode
                                 );
 
                                 if let Some(ref curse_file) = curse_file {
                                     let mut curse_file = curse_file.lock().unwrap();
                                     curse_file.write_all(
-                                        format!("{:?} {worker_name}: voted to curse due to anomaly {:?}\n", 
-                                        chrono::Utc::now(), anomaly).as_bytes(),
+                                        format!("{:?} {worker_name}: voted to curse due to anomaly {:?} with curse id {} and curse type {:?}\n", 
+                                        chrono::Utc::now(), anomaly, curse_id, curse_type).as_bytes(),
                                     )?;
                                     curse_file.flush()?;
                                 }
                             }
                             VotingMode::Active => {
                                 error!(
-                                    "{worker_name}: voting to curse due to anomaly {:?} with curse id {}",
-                                    anomaly, curse_id
+                                    "{worker_name}: voting to curse due to anomaly {:?} with curse id {} and curse type {:?}",
+                                    anomaly, curse_id, curse_type
                                 );
-                                match afn_contract.send_vote_to_curse(&mut tx_sender, curse_id) {
+                                match afn_contract.send_vote_to_curse(&mut tx_sender, curse_id, &curse_type) {
                                     Err(err) => {
                                         warn!(
                                             "{worker_name}: failed to vote to curse due to anomaly {:?} \
-                                            with curse id {} with error {:?}; \
+                                            with curse id {} and curse type {:?} with error {:?}; \
                                             check the error: if execution reverted, we likely already managed to \
                                             send a vote for this curse id and this is to be expected",
-                                            anomaly, curse_id, err
+                                            anomaly, curse_id, curse_type, err
                                         );
                                     }
                                     Ok(txid) => {
@@ -111,8 +124,8 @@ impl VoteToCurseWorker {
                                             curse_id,
                                             Instant::now()+crate::config::VOTE_TO_CURSE_SEND_INTERVAL_PER_CURSE_ID
                                         );
-                                        info!("{worker_name}: voted to curse due to anomaly {:?} with txid {}",
-                                        anomaly, txid);
+                                        info!("{worker_name}: voted to curse due to anomaly {:?} with txid {}, curse id {} and curse type {:?}",
+                                        anomaly, txid, curse_id, curse_type,);
                                     }
                                 }
                             }
