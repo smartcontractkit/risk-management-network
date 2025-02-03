@@ -1,0 +1,33 @@
+syntax="proto3";
+
+package offchainreporting3_config;
+option go_package = ".;ocr3config";
+
+message OffchainConfigProto {
+  reserved 1 to 16;
+  reserved 17 to 24;
+  uint64 delta_progress_nanoseconds = 25;
+  uint64 delta_resend_nanoseconds = 26;
+  uint64 delta_initial_nanoseconds = 40;
+  uint64 delta_round_nanoseconds = 27;
+  uint64 delta_grace_nanoseconds = 28;
+  uint64 delta_certified_commit_request_nanoseconds = 41;
+  uint64 delta_stage_nanoseconds = 29;
+  uint64 r_max = 30;
+  repeated uint32 s = 31;
+  repeated bytes offchain_public_keys = 32;
+  repeated string peer_ids = 33;
+  bytes reporting_plugin_config = 34;
+  uint64 max_duration_query_nanoseconds = 35;
+  uint64 max_duration_observation_nanoseconds = 36;
+  uint64 max_duration_should_accept_attested_report_nanoseconds = 37;
+  uint64 max_duration_should_transmit_accepted_report_nanoseconds = 38;
+  SharedSecretEncryptionsProto shared_secret_encryptions = 39;
+}
+
+
+message SharedSecretEncryptionsProto {
+  bytes diffieHellmanPoint = 1;
+  bytes sharedSecretHash = 2;
+  repeated bytes encryptions = 3;
+}

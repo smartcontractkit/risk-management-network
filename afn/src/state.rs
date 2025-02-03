@@ -4,9 +4,9 @@ use super::{
     lane_state::LaneState,
 };
 use crate::{
-    chain_selector::chain_selector,
     chain_state::ChainState,
     chain_status_worker::ChainStatusProvider,
+    chains::chain_selector,
     common::{ChainName, LaneId},
     config::{OffchainConfig, SharedChainConfig, SharedLaneConfig},
     config_sanity_check::{
@@ -442,7 +442,7 @@ impl State {
             rpcs.insert(
                 chain_name,
                 Arc::new(Rpc::new_with_multiple_urls(
-                    chain_name as u64,
+                    chain_name.chain_id(),
                     &local_chain_config.rpcs,
                 )?),
             );
@@ -651,7 +651,7 @@ impl State {
 
         shutdown_handles.add(MetricsFileWorker::spawn(
             Arc::clone(&ctx),
-            metrics,
+            move || metrics.get_prometheus_file_lines(),
             metrics_file_path,
         )?);
 

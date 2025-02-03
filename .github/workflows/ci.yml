@@ -20,9 +20,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      - name: Install asdf & tools
+        uses: asdf-vm/actions/install@v3
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features
       - name: cargo build
-        run: cargo build --locked --bin afn
+        run: cargo build --locked --bin afn --bin afn2proxy

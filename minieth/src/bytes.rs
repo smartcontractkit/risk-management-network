@@ -19,6 +19,18 @@ pub enum BytesDecodeError {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SizedBytes<const N: usize>([u8; N]);
 
+impl<const N: usize> TryFrom<Vec<u8>> for SizedBytes<N> {
+    type Error = BytesDecodeError;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        if let Ok(fix_size) = <[u8; N]>::try_from(value) {
+            Ok(fix_size.into())
+        } else {
+            Err(BytesDecodeError::InvalidSize)
+        }
+    }
+}
+
 impl<const N: usize> From<[u8; N]> for SizedBytes<N> {
     fn from(b: [u8; N]) -> Self {
         Self(b)
@@ -75,6 +87,16 @@ impl<const N: usize> SizedBytes<N> {
     pub fn from_vec(v: Vec<u8>) -> Result<Self, <[u8; N] as TryFrom<Vec<u8>>>::Error> {
         let array: [u8; N] = v.try_into()?;
         Ok(array.into())
+    }
+
+    pub fn from_str_literal(s: &str) -> Option<Self> {
+        let mut bytes = [0u8; N];
+        let s_as_bytes = s.as_bytes();
+        if s_as_bytes.len() > bytes.len() {
+            return None;
+        }
+        bytes[..s_as_bytes.len()].copy_from_slice(s_as_bytes);
+        Some(bytes.into())
     }
 }
 
@@ -133,6 +155,7 @@ impl<const N: usize> quickcheck::Arbitrary for SizedBytes<N> {
     }
 }
 
+pub type Bytes4 = SizedBytes<4>;
 pub type Bytes16 = SizedBytes<16>;
 pub type Bytes20 = SizedBytes<20>;
 pub type Bytes32 = SizedBytes<32>;

@@ -74,6 +74,7 @@ impl_abi_encode_tuple!((A, a), (B, b), (C, c),);
 impl_abi_encode_tuple!((A, a), (B, b), (C, c), (D, d),);
 impl_abi_encode_tuple!((A, a), (B, b), (C, c), (D, d), (E, e),);
 impl_abi_encode_tuple!((A, a), (B, b), (C, c), (D, d), (E, e), (F, f),);
+impl_abi_encode_tuple!((A, a), (B, b), (C, c), (D, d), (E, e), (F, f), (G, g),);
 impl_abi_encode_tuple!(
     (A, a),
     (B, b),

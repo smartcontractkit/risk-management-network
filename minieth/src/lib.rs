@@ -1,3 +1,4 @@
+#![allow(clippy::empty_line_after_doc_comments)]
 pub mod bytes;
 pub mod ecdsa;
 pub use secp256k1::rand;

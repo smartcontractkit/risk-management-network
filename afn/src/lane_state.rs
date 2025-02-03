@@ -1,6 +1,6 @@
 use crate::{
-    chain_selector::chain_selector,
     chain_status_worker::ChainStatusWorker,
+    chains::chain_selector,
     common::LaneId,
     config::{SharedChainConfig, SharedLaneConfig},
     contract_event_state_machine::{

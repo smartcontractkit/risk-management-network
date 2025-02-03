@@ -1,5 +1,5 @@
 use crate::{
-    chain_selector::chain_selector,
+    chains::chain_selector,
     common::{ChainName, ContractCall},
     curse_beacon::CurseId,
 };

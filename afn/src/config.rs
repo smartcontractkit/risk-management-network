@@ -60,6 +60,7 @@ pub enum ChainStability {
         hard_confirmations: u64,
     },
     FinalityTag {
+        #[serde(default)]
         soft_confirmations: u64,
     },
     PolkadotGetFinalizedHead,

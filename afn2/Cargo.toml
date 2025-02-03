@@ -1,0 +1,26 @@
+[package]
+name = "afn2"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+afn = { path = "../afn" }
+minieth = { path = "../minieth" }
+miniabi = { path = "../miniabi" }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+thiserror = "1"
+openssl = { version = "0.10", features = ["vendored"] }
+serde_json = "1"
+serde = "1"
+argh = "0.1"
+toml = "0.8"
+prost = "0.13.1"
+prost-types = "0.13.1"
+crossbeam-channel = "0.5.13"
+defer = "0.2.1"
+base58 = "0.2.0"
+[build-dependencies]
+prost-build = "0.13.1"
+[features]
+arbitrary = []
