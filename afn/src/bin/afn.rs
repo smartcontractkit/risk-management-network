@@ -4,7 +4,6 @@ use afn::{
     config::{find_duplicate, load_config_files, OffchainConfig},
     curse_beacon::BaseCurseId,
     encryption::EncryptedSecrets,
-    forensics::LogRotate,
     key_types::{BlessCurseKeys, BlessCurseKeysByChain},
     state::{self, MonitorResult},
     worker,
@@ -22,11 +21,10 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use tracing::{error, warn};
 
-const LOG_JSON_ENV_VAR: &str = "AFN_LOG_JSON";
 const PASSPHRASE_ENV_VAR: &str = "AFN_PASSPHRASE";
 const PASSPHRASE_NEW_ENV_VAR: &str = "AFN_PASSPHRASE_NEW";
 const METRICS_FILE_PATH_ENV_VAR: &str = "AFN_METRICS_FILE";
@@ -85,55 +83,6 @@ fn ensure_keys_for_chains(config: &OffchainConfig, keys: &BlessCurseKeysByChain)
     true
 }
 
-fn setup_tracing() -> Result<()> {
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{filter, filter::LevelFilter, EnvFilter};
-
-    let forensics_layer = tracing_subscriber::fmt::layer()
-        .with_writer(Mutex::new(LogRotate::new(
-            afn::config::FORENSICS_LOGROTATE_CONFIG,
-        )?))
-        .json()
-        .flatten_event(true)
-        .with_filter(filter::Targets::new().with_targets(vec![
-            (
-                minieth::json_rpc::LOG_SPAM_FORENSICS_TARGET,
-                LevelFilter::TRACE,
-            ),
-            ("", LevelFilter::DEBUG),
-        ]));
-
-    let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
-
-    let wrap_tracing_error = |e| anyhow::anyhow!("failed to initialize tracing: {e:?}");
-
-    match env::var(LOG_JSON_ENV_VAR).as_deref() {
-        Ok("on") => {
-            let stdout_json_layer = tracing_subscriber::fmt::layer().json().flatten_event(true);
-            tracing_subscriber::registry()
-                .with(forensics_layer)
-                .with(stdout_json_layer.with_filter(env_filter))
-                .try_init()
-                .map_err(wrap_tracing_error)?;
-        }
-        Ok("off") | Err(VarError::NotPresent) => {
-            let stdout_compact_layer = tracing_subscriber::fmt::layer().compact();
-            tracing_subscriber::registry()
-                .with(forensics_layer)
-                .with(stdout_compact_layer.with_filter(env_filter))
-                .try_init()
-                .map_err(wrap_tracing_error)?;
-        }
-        v => {
-            bail!("invalid value for {LOG_JSON_ENV_VAR}: {:?}", v);
-        }
-    }
-
-    Ok(())
-}
-
 fn run_afn(
     voting_mode: VotingMode,
     keystore_path: Option<String>,
@@ -142,7 +91,7 @@ fn run_afn(
     check_rpc_pruning: bool,
     experimental: bool,
 ) -> Result<()> {
-    setup_tracing()?;
+    afn::logging::setup_tracing()?;
 
     let config = load_config_files()?;
 
@@ -517,7 +466,7 @@ struct SignManualTransaction {
 
     #[argh(
         switch,
-        description = "required flag, please make sure you understand the risk of signing an arbirary manual transaction"
+        description = "required flag, please make sure you understand the risk of signing an arbitrary manual transaction"
     )]
     i_really_know_what_i_am_doing: bool,
 }
@@ -525,7 +474,7 @@ struct SignManualTransaction {
 impl ExecutableCmd for SignManualTransaction {
     fn execute_cmd(&self) -> Result<()> {
         if !self.i_really_know_what_i_am_doing {
-            bail!("Please provide flag '--i-really-know-what-i-am-doing' and make sure you understand the risk of signing an arbirary manual transaction")
+            bail!("Please provide flag '--i-really-know-what-i-am-doing' and make sure you understand the risk of signing an arbitrary manual transaction")
         }
 
         let bless_curse_keys_by_chain = {

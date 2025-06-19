@@ -124,6 +124,6 @@ impl Tail {
 
     pub fn contains(&self, header: &Block) -> bool {
         self.block_by_number(header.number)
-            .map_or(false, |block| block.hash == header.hash)
+            .is_some_and(|block| block.hash == header.hash)
     }
 }

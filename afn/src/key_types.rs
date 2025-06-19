@@ -145,7 +145,7 @@ impl Debug for BlessCurseKeysByChain {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[derive(PartialEq, Eq, Hash)]
         struct UnquoteString<'a>(&'a str);
-        impl<'a> Debug for UnquoteString<'a> {
+        impl Debug for UnquoteString<'_> {
             fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 fmt.write_str(self.0)
             }

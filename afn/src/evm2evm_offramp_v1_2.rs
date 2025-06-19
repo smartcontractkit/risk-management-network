@@ -1,4 +1,4 @@
-use crate::chain_selector::ChainSelector;
+use crate::chains::ChainSelector;
 use miniabi::{
     abi_decode::{AbiDecodeError, AbiTypeToDecode},
     types::{Type, Value},

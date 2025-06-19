@@ -21,6 +21,31 @@ pub struct ChainState {
     pub gas_fee_metrics_update_worker: Arc<GasFeeMetricsUpdateWorker>,
 }
 
+pub fn make_chain_status_updater(
+    rpc: Arc<Rpc>,
+    stability: ChainStability,
+) -> Box<dyn ChainStatusUpdater + Send> {
+    match stability {
+        ChainStability::ConfirmationDepth {
+            soft_confirmations,
+            hard_confirmations,
+        } => Box::new(ConfirmationDepthChainStatusUpdater {
+            soft_confirmations: soft_confirmations as usize,
+            hard_confirmations: hard_confirmations as usize,
+            rpc,
+        }),
+        ChainStability::FinalityTag {
+            soft_confirmations: _,
+        } => Box::new(FinalityTagChainStatusUpdater { rpc }),
+        ChainStability::PolkadotGetFinalizedHead => {
+            Box::new(PolkadotGetFinalizedHeadChainStatusUpdater {
+                polkadot_rpc: rpc.clone(),
+                rpc,
+            })
+        }
+    }
+}
+
 impl ChainState {
     pub fn new_and_spawn_workers(
         ctx: &Arc<worker::Context>,
@@ -31,28 +56,8 @@ impl ChainState {
     ) -> Result<(Self, ShutdownHandleGroup)> {
         let mut shutdown_handles = ShutdownHandleGroup::default();
         let chain_status_worker = {
-            let chain_status_updater: Box<dyn ChainStatusUpdater + Send> = {
-                let rpc = Arc::clone(&rpc);
-                match config.stability {
-                    ChainStability::ConfirmationDepth {
-                        soft_confirmations,
-                        hard_confirmations,
-                    } => Box::new(ConfirmationDepthChainStatusUpdater {
-                        soft_confirmations: soft_confirmations as usize,
-                        hard_confirmations: hard_confirmations as usize,
-                        rpc,
-                    }),
-                    ChainStability::FinalityTag {
-                        soft_confirmations: _,
-                    } => Box::new(FinalityTagChainStatusUpdater { rpc }),
-                    ChainStability::PolkadotGetFinalizedHead => {
-                        Box::new(PolkadotGetFinalizedHeadChainStatusUpdater {
-                            polkadot_rpc: rpc.clone(),
-                            rpc,
-                        })
-                    }
-                }
-            };
+            let chain_status_updater: Box<dyn ChainStatusUpdater + Send> =
+                make_chain_status_updater(Arc::clone(&rpc), config.stability);
             shutdown_handles.add(ChainStatusWorker::spawn(
                 ctx,
                 config.name,

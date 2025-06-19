@@ -2,7 +2,7 @@ use miniabi::{abi_decode::AbiDecode, types::Value};
 use minieth::{bytes::Address, rpc::Rpc};
 
 use crate::{
-    chain_selector::ChainSelector,
+    chains::ChainSelector,
     commit_store,
     common::{ContractCall, EncodeContractCall},
     config::LaneType,
@@ -15,10 +15,10 @@ pub struct OnRampStaticConfig {
     pub dest_chain_selector: ChainSelector,
 }
 
-type OnRarmpStaticConfigV1_2 = evm2evm_onramp_v1_2::StaticConfigV1_2;
+type OnRampStaticConfigV1_2 = evm2evm_onramp_v1_2::StaticConfigV1_2;
 
-impl From<OnRarmpStaticConfigV1_2> for OnRampStaticConfig {
-    fn from(value: OnRarmpStaticConfigV1_2) -> Self {
+impl From<OnRampStaticConfigV1_2> for OnRampStaticConfig {
+    fn from(value: OnRampStaticConfigV1_2) -> Self {
         Self {
             chain_selector: value.chain_selector,
             dest_chain_selector: value.dest_chain_selector,
@@ -99,7 +99,7 @@ pub fn onchain_onramp_static_config(
 ) -> anyhow::Result<OnRampStaticConfig> {
     match lane_type {
         LaneType::Evm2EvmV1_2 => {
-            fetch_onchain_static_config::<OnRarmpStaticConfigV1_2>(rpc, on_ramp)
+            fetch_onchain_static_config::<OnRampStaticConfigV1_2>(rpc, on_ramp)
                 .map(OnRampStaticConfig::from)
         }
         LaneType::Evm2EvmV1_5 => {

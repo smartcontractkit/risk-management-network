@@ -1,5 +1,5 @@
 use crate::{
-    chain_selector::ChainSelector,
+    chains::ChainSelector,
     common::{LogSignature, UncheckedDecodeLog},
     evm_common_types::EVMTokenAmount,
     hashable::{metadata_hash, Hashable, MessageMetadata},

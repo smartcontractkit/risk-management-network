@@ -50,7 +50,7 @@ impl fmt::Display for U256 {
         if self.hi == 0 {
             write!(f, "0x{:x}", self.lo)
         } else {
-            write!(f, "0x{:x}{:x}", self.hi, self.lo)
+            write!(f, "0x{:x}{:032x}", self.hi, self.lo)
         }
     }
 }

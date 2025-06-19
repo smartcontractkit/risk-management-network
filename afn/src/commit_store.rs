@@ -1,4 +1,4 @@
-use crate::chain_selector::ChainSelector;
+use crate::chains::ChainSelector;
 use crate::onramp_traits::OnRampReader;
 use crate::{
     common::{LogSignature, UncheckedDecodeLog},

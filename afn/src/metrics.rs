@@ -258,7 +258,7 @@ impl LabelKey for () {
     }
 }
 
-fn join_prometheus_grouped_lines_with_spacing(grouped_lines: Vec<Vec<String>>) -> Vec<String> {
+pub fn join_prometheus_grouped_lines_with_spacing(grouped_lines: Vec<Vec<String>>) -> Vec<String> {
     grouped_lines
         .into_iter()
         .enumerate()
@@ -380,7 +380,7 @@ impl WorkerMetrics {
             consecutive_worker_errors,
         }
     }
-    fn get_prometheus_file_lines(&self) -> Vec<String> {
+    pub fn get_prometheus_file_lines(&self) -> Vec<String> {
         join_prometheus_grouped_lines_with_spacing(vec![
             self.last_poll_duration_seconds.get_prometheus_file_lines(),
             self.next_poll_delay_seconds.get_prometheus_file_lines(),
@@ -447,7 +447,7 @@ impl ChainStatusMetrics {
             finalized_block_timestamp,
         }
     }
-    fn get_prometheus_file_lines(&self) -> Vec<String> {
+    pub fn get_prometheus_file_lines(&self) -> Vec<String> {
         join_prometheus_grouped_lines_with_spacing(vec![
             self.latest_block_number.get_prometheus_file_lines(),
             self.finalized_block_number.get_prometheus_file_lines(),
@@ -666,7 +666,7 @@ impl Metrics {
         }
     }
 
-    fn get_prometheus_file_lines(&self) -> Vec<String> {
+    pub fn get_prometheus_file_lines(&self) -> Vec<String> {
         join_prometheus_grouped_lines_with_spacing(vec![
             self.uptime_seconds.get_prometheus_file_lines(),
             self.disabled_chains.get_prometheus_file_lines(),
@@ -700,11 +700,14 @@ fn ensure_writable_file(path: impl AsRef<Path>) -> Result<()> {
 
 pub struct MetricsFileWorker {}
 impl MetricsFileWorker {
-    pub fn spawn(
+    pub fn spawn<F>(
         ctx: Arc<worker::Context>,
-        metrics: Metrics,
+        mut metrics_fn: F,
         metrics_file_path: Option<PathBuf>,
-    ) -> Result<(Self, ShutdownHandle)> {
+    ) -> Result<(Self, ShutdownHandle)>
+    where
+        F: FnMut() -> Vec<String> + Send + 'static,
+    {
         let worker_name = "MetricsFileWorker";
         let (metrics_file_path, metrics_temp_file_path) = {
             let metrics_file_path = match metrics_file_path {
@@ -728,7 +731,7 @@ impl MetricsFileWorker {
                 METRICS_FILE_WORKER_POLL_INTERVAL,
                 move |_ctx: &worker::Context| -> Result<()> {
                     let mut temp_file = File::create(&metrics_temp_file_path)?;
-                    let file_lines = metrics.get_prometheus_file_lines();
+                    let file_lines = metrics_fn();
                     debug!(
                         "{worker_name}: writing {} lines to metric file {}",
                         file_lines.len(),

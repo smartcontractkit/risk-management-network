@@ -35,9 +35,9 @@ impl TryFrom<Bytes> for PublicKey {
 
 #[derive(Clone, Copy, Debug)]
 pub struct EthereumSignature {
-    v: U256,
-    r: U256,
-    s: U256,
+    pub v: U256,
+    pub r: U256,
+    pub s: U256,
 }
 
 impl RlpEncodable for EthereumSignature {
